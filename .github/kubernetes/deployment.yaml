@@ -1,0 +1,297 @@
+# Enhanced Kubernetes Deployment Configuration
+# GitHub Actions Integration with Security Best Practices
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secure-nodejs-app
+  namespace: secure-app
+  labels:
+    app: secure-nodejs-app
+    version: v1
+    managed-by: github-actions
+    security-scan: passed
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: secure-nodejs-app
+  template:
+    metadata:
+      labels:
+        app: secure-nodejs-app
+        version: v1
+        managed-by: github-actions
+        security-scan: passed
+      annotations:
+        # Security annotations
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "true"
+        kubernetes.io/managed-by: "github-actions"
+        # Security scan metadata
+        security-scan.timestamp: "{{ github.event.head_commit.timestamp }}"
+        security-scan.commit: "{{ github.sha }}"
+        security-scan.run-id: "{{ github.run_id }}"
+        # Container security
+        container.apparmor.security.beta.kubernetes.io/secure-nodejs-app: "runtime/default"
+        container.seccomp.security.alpha.kubernetes.io/secure-nodejs-app: "runtime/default"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: secure-nodejs-app
+      automountServiceAccountToken: false
+      containers:
+      - name: secure-nodejs-app
+        image: ghcr.io/{{ github.repository }}/secure-nodejs-app:{{ github.sha }}
+        imagePullPolicy: Always
+
+        # Security context for container
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+          runAsNonRoot: true
+          runAsUser: 1001
+          runAsGroup: 1001
+
+        ports:
+        - name: http
+          containerPort: 3000
+          protocol: TCP
+
+        # Health checks
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+          successThreshold: 1
+
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: http
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+          successThreshold: 1
+
+        startupProbe:
+          httpGet:
+            path: /health
+            port: http
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 30
+          successThreshold: 1
+
+        # Environment variables
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: PORT
+          value: "3000"
+        - name: APP_VERSION
+          value: "{{ github.sha }}"
+        - name: DEPLOY_TIME
+          value: "{{ github.event.head_commit.timestamp }}"
+        - name: RUN_ID
+          value: "{{ github.run_id }}"
+        - name: REPO_NAME
+          value: "{{ github.repository }}"
+        # Security headers
+        - name: FORCE_HTTPS
+          value: "true"
+        - name: RATE_LIMIT_WINDOW
+          value: "900000"
+        - name: RATE_LIMIT_MAX
+          value: "100"
+        # Database connection (use secrets)
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: database-url
+        # API keys
+        - name: API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: api-key
+
+        # Resource limits
+        resources:
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+            ephemeral-storage: "1Gi"
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+            ephemeral-storage: "512Mi"
+
+        # Volume mounts for read-only data
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+
+      # Image pull secrets for private registry
+      imagePullSecrets:
+      - name: ghcr-secret
+
+      # Volumes
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: config
+        configMap:
+          name: app-config
+
+      # Node selection and tolerations
+      nodeSelector:
+        kubernetes.io/os: linux
+        node-type: application
+      tolerations:
+      - key: "application"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - secure-nodejs-app
+              topologyKey: kubernetes.io/hostname
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: secure-nodejs-app-service
+  namespace: secure-app
+  labels:
+    app: secure-nodejs-app
+    managed-by: github-actions
+  annotations:
+    # Cloud provider annotations
+    cloud.google.com/load-balancer-type: "External"
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/azure-load-balancer-internal: "false"
+    # Security annotations
+    service.beta.kubernetes.io/aws-load-balancer-ssl-ports: "https"
+    service.beta.kubernetes.io/aws-load-balancer-backend-protocol: "http"
+spec:
+  type: LoadBalancer
+  sessionAffinity: None
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    protocol: TCP
+  - name: https
+    port: 443
+    targetPort: http
+    protocol: TCP
+  selector:
+    app: secure-nodejs-app
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: secure-app
+  labels:
+    app: secure-nodejs-app
+    managed-by: github-actions
+data:
+  config.json: |
+    {
+      "app": {
+        "name": "Secure Node.js Application",
+        "version": "1.0.0",
+        "description": "Secure Node.js application deployed via GitHub Actions"
+      },
+      "security": {
+        "helmet": true,
+        "cors": {
+          "origin": ["https://{{ github.repository_owner }}.github.io"],
+          "credentials": true
+        },
+        "rateLimit": {
+          "windowMs": 900000,
+          "max": 100
+        }
+      },
+      "logging": {
+        "level": "info",
+        "format": "json"
+      }
+    }
+  nginx.conf: |
+    server {
+        listen 80;
+        server_name _;
+
+        # Security headers
+        add_header X-Frame-Options DENY;
+        add_header X-Content-Type-Options nosniff;
+        add_header X-XSS-Protection "1; mode=block";
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains";
+        add_header Referrer-Policy "strict-origin-when-cross-origin";
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';";
+
+        # Hide server version
+        server_tokens off;
+
+        # Rate limiting
+        limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+        limit_req zone=api burst=20 nodelay;
+
+        location / {
+            proxy_pass http://localhost:3000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # Timeouts
+            proxy_connect_timeout 30s;
+            proxy_send_timeout 30s;
+            proxy_read_timeout 30s;
+        }
+
+        # Health check endpoint
+        location /health {
+            access_log off;
+            proxy_pass http://localhost:3000/health;
+        }
+    }

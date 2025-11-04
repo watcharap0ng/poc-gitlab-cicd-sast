@@ -1,0 +1,412 @@
+# Kubernetes Security Resources
+# Network Policies, RBAC, Pod Security, and Security Contexts
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: secure-app
+  labels:
+    name: secure-app
+    environment: production
+    managed-by: github-actions
+    security-level: high
+  annotations:
+    description: "Secure namespace for Node.js application"
+    contact: "security-team@company.com"
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: secure-nodejs-app
+  namespace: secure-app
+  labels:
+    app: secure-nodejs-app
+    managed-by: github-actions
+  annotations:
+    iam.amazonaws.com/role: "arn:aws:iam::ACCOUNT:role/secure-nodejs-app-role"
+automountServiceAccountToken: false
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: secure-app
+  name: secure-nodejs-app-role
+  labels:
+    app: secure-nodejs-app
+    managed-by: github-actions
+rules:
+# Allow basic pod operations
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch"]
+# Allow config and secret access
+- apiGroups: [""]
+  resources: ["configmaps", "secrets"]
+  verbs: ["get", "list"]
+# Allow service discovery
+- apiGroups: [""]
+  resources: ["services", "endpoints"]
+  verbs: ["get", "list", "watch"]
+# Allow basic event reading
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: secure-nodejs-app-binding
+  namespace: secure-app
+  labels:
+    app: secure-nodejs-app
+    managed-by: github-actions
+subjects:
+- kind: ServiceAccount
+  name: secure-nodejs-app
+  namespace: secure-app
+roleRef:
+  kind: Role
+  name: secure-nodejs-app-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: secure-nodejs-app-pdb
+  namespace: secure-app
+  labels:
+    app: secure-nodejs-app
+    managed-by: github-actions
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: secure-nodejs-app
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: secure-nodejs-app-netpol
+  namespace: secure-app
+  labels:
+    app: secure-nodejs-app
+    managed-by: github-actions
+spec:
+  podSelector:
+    matchLabels:
+      app: secure-nodejs-app
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow traffic from load balancer and ingress
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: TCP
+      port: 3000
+  # Allow traffic from monitoring
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    - podSelector:
+        matchLabels:
+          app: prometheus
+    ports:
+    - protocol: TCP
+      port: 3000
+  egress:
+  # Allow DNS
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+  # Allow HTTPS outbound (for APIs)
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+  # Allow HTTP outbound (for package downloads)
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 80
+  # Allow database access
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgresql
+    ports:
+    - protocol: TCP
+      port: 5432
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis
+    ports:
+    - protocol: TCP
+      port: 6379
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secrets
+  namespace: secure-app
+  labels:
+    app: secure-nodejs-app
+    managed-by: github-actions
+    type: application-secret
+type: Opaque
+data:
+  # Base64 encoded values (replace with actual secrets)
+  database-url: <BASE64_ENCODED_DATABASE_URL>
+  api-key: <BASE64_ENCODED_API_KEY>
+  jwt-secret: <BASE64_ENCODED_JWT_SECRET>
+  session-secret: <BASE64_ENCODED_SESSION_SECRET>
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ghcr-secret
+  namespace: secure-app
+  labels:
+    app: secure-nodejs-app
+    managed-by: github-actions
+    type: registry-secret
+type: kubernetes.io/dockerconfigjson
+data:
+  # Docker config JSON for GitHub Container Registry
+  .dockerconfigjson: <BASE64_ENCODED_DOCKER_CONFIG>
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: security-sidecar
+  namespace: secure-app
+  labels:
+    app: security-sidecar
+    managed-by: github-actions
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: security-sidecar
+  template:
+    metadata:
+      labels:
+        app: security-sidecar
+        managed-by: github-actions
+      annotations:
+        container.apparmor.security.beta.kubernetes.io/security-sidecar: "runtime/default"
+    spec:
+      serviceAccountName: secure-nodejs-app
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+      containers:
+      - name: filebeat
+        image: docker.elastic.co/beats/filebeat:8.5.0
+        args: [
+          "-c", "/etc/filebeat.yml",
+          "-e",
+        ]
+        env:
+        - name: ELASTICSEARCH_HOST
+          value: elasticsearch.monitoring.svc.cluster.local:9200
+        - name: ELASTICSEARCH_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: elasticsearch-credentials
+              key: username
+        - name: ELASTICSEARCH_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: elasticsearch-credentials
+              key: password
+        securityContext:
+          runAsUser: 0
+          runAsGroup: 0
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          limits:
+            cpu: "200m"
+            memory: "200Mi"
+          requests:
+            cpu: "100m"
+            memory: "100Mi"
+        volumeMounts:
+        - name: config
+          mountPath: /etc/filebeat.yml
+          readOnly: true
+          subPath: filebeat.yml
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+        - name: varlog
+          mountPath: /var/log
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          defaultMode: 0600
+          name: filebeat-config
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+      - name: varlog
+        hostPath:
+          path: /var/log
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: filebeat-config
+  namespace: secure-app
+  labels:
+    app: security-sidecar
+    managed-by: github-actions
+data:
+  filebeat.yml: |
+    filebeat.inputs:
+    - type: container
+      paths:
+        - /var/log/containers/*secure-nodejs-app*.log
+      processors:
+        - add_kubernetes_metadata:
+            host: ${NODE_NAME}
+            matchers:
+            - logs_path:
+                logs_path: "/var/log/containers/"
+
+    output.elasticsearch:
+      hosts: ["${ELASTICSEARCH_HOST}"]
+      username: "${ELASTICSEARCH_USERNAME}"
+      password: "${ELASTICSEARCH_PASSWORD}"
+      index: "secure-app-%{+yyyy.MM.dd}"
+
+    logging.level: info
+    logging.to_files: true
+    logging.files:
+      path: /var/log/filebeat
+      name: filebeat
+      keepfiles: 7
+      permissions: 0644
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: secure-nodejs-app-hpa
+  namespace: secure-app
+  labels:
+    app: secure-nodejs-app
+    managed-by: github-actions
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: secure-nodejs-app
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  - type: Pods
+    pods:
+      metric:
+        name: http_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "100"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: secure-app-quota
+  namespace: secure-app
+  labels:
+    app: secure-nodejs-app
+    managed-by: github-actions
+spec:
+  hard:
+    requests.cpu: "2"
+    requests.memory: "4Gi"
+    limits.cpu: "4"
+    limits.memory: "8Gi"
+    persistentvolumeclaims: "4"
+    pods: "20"
+    services: "10"
+    secrets: "10"
+    configmaps: "10"
+
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: secure-app-limits
+  namespace: secure-app
+  labels:
+    app: secure-nodejs-app
+    managed-by: github-actions
+spec:
+  limits:
+  - default:
+      cpu: "500m"
+      memory: "512Mi"
+    defaultRequest:
+      cpu: "100m"
+      memory: "128Mi"
+    type: Container
+  - max:
+      cpu: "1"
+      memory: "1Gi"
+    min:
+      cpu: "50m"
+      memory: "64Mi"
+    type: Container

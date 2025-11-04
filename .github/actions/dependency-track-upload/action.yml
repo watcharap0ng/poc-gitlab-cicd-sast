@@ -1,0 +1,242 @@
+name: 'Dependency-Track Upload'
+description: 'Upload SBOM to Dependency-Track with analysis'
+inputs:
+  dependency-track-url:
+    description: 'Dependency-Track base URL'
+    required: true
+  api-key:
+    description: 'Dependency-Track API key'
+    required: true
+  project-name:
+    description: 'Project name in Dependency-Track'
+    required: true
+  project-version:
+    description: 'Project version'
+    required: false
+    default: 'latest'
+  bom-file:
+    description: 'Path to SBOM file'
+    required: false
+    default: 'syft-sbom.cdx.json'
+  auto-create:
+    description: 'Auto-create project if it does not exist'
+    required: false
+    default: 'true'
+outputs:
+  project-uuid:
+    description: 'Dependency-Track project UUID'
+    value: ${{ steps.upload.outputs.project-uuid }}
+  findings-count:
+    description: 'Number of vulnerability findings'
+    value: ${{ steps.upload.outputs.findings-count }}
+  analysis-status:
+    description: 'Analysis completion status'
+    value: ${{ steps.upload.outputs.analysis-status }}
+runs:
+  using: 'composite'
+  steps:
+    - name: 📤 Upload to Dependency-Track
+      id: upload
+      shell: bash
+      run: |
+        # Configuration
+        DT_URL="${{ inputs.dependency-track-url }}"
+        DT_API_KEY="${{ inputs.api-key }}"
+        PROJECT_NAME="${{ inputs.project-name }}"
+        PROJECT_VERSION="${{ inputs.project-version }}"
+        BOM_FILE="${{ inputs.bom-file }}"
+        AUTO_CREATE="${{ inputs.auto-create }}"
+
+        echo "🔍 Enhanced Dependency-Track SBOM Processing..."
+        echo "   URL: $DT_URL"
+        echo "   Project: $PROJECT_NAME"
+        echo "   Version: $PROJECT_VERSION"
+        echo "   SBOM File: $BOM_FILE"
+
+        # Check if SBOM file exists and is valid
+        if [ ! -f "$BOM_FILE" ] || [ ! -s "$BOM_FILE" ]; then
+          echo "⚠️  SBOM file not found or empty: $BOM_FILE"
+
+          # Try alternative SBOM files
+          for alt_file in docker-sbom.cdx.json sbom.cdx.json syft.cdx.json; do
+            if [ -f "$alt_file" ] && [ -s "$alt_file" ]; then
+              echo "📄 Using alternative SBOM file: $alt_file"
+              BOM_FILE="$alt_file"
+              break
+            fi
+          done
+
+          # If still no SBOM file, try to generate one
+          if [ ! -f "$BOM_FILE" ] || [ ! -s "$BOM_FILE" ]; then
+            echo "⚠️  No SBOM file found, attempting to generate one..."
+            if [ -f "package.json" ]; then
+              pip3 install cyclonedx-bom
+              cyclonedx-bom -o generated-sbom.cdx.json
+              if [ -f "generated-sbom.cdx.json" ]; then
+                BOM_FILE="generated-sbom.cdx.json"
+                echo "✅ Generated new SBOM: $BOM_FILE"
+              fi
+            fi
+          fi
+        fi
+
+        # Final check
+        if [ ! -f "$BOM_FILE" ] || [ ! -s "$BOM_FILE" ]; then
+          echo "❌ No SBOM file available for Dependency-Track upload"
+          echo "::set-output name=analysis-status::failed"
+          exit 1
+        fi
+
+        # Validate SBOM file
+        if ! python3 -c "import json; json.load(open('$BOM_FILE'))" 2>/dev/null; then
+          echo "❌ Invalid JSON in SBOM file: $BOM_FILE"
+          echo "::set-output name=analysis-status::failed"
+          exit 1
+        fi
+
+        echo "📤 Submitting SBOM to Dependency-Track..."
+
+        # Submit SBOM to Dependency-Track
+        RESPONSE=$(curl -s -w "%{http_code}" -o dt_response.json \
+          -X POST "${DT_URL}/api/v1/bom" \
+          -H "Content-Type: multipart/form-data" \
+          -H "X-API-Key: ${DT_API_KEY}" \
+          -F "projectName=${PROJECT_NAME}" \
+          -F "projectVersion=${PROJECT_VERSION}" \
+          -F "autoCreate=${AUTO_CREATE}" \
+          -F "bom=@${BOM_FILE}")
+
+        HTTP_CODE="${RESPONSE: -3}"
+
+        if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "202" ]; then
+          echo "✅ SBOM submitted successfully to Dependency-Track"
+
+          # Extract project information from response
+          if [ -f "dt_response.json" ] && [ -s "dt_response.json" ]; then
+            PROJECT_UUID=$(cat dt_response.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    print(data.get('uuid', ''))
+except:
+    pass
+" 2>/dev/null || echo "")
+
+            if [ -n "$PROJECT_UUID" ]; then
+              echo "🔗 Project UUID: $PROJECT_UUID"
+
+              # Wait for analysis to complete
+              echo "⏳ Waiting for Dependency-Track analysis..."
+              sleep 30
+
+              # Get vulnerability findings
+              echo "📊 Retrieving vulnerability analysis..."
+              FINDINGS_RESPONSE=$(curl -s -w "%{http_code}" -o dependency_track_findings.json \
+                -H "X-API-Key: ${DT_API_KEY}" \
+                "${DT_URL}/api/v1/finding/project/${PROJECT_UUID}")
+
+              FINDINGS_HTTP_CODE="${FINDINGS_RESPONSE: -3}"
+
+              if [ "$FINDINGS_HTTP_CODE" = "200" ]; then
+                if [ -f "dependency_track_findings.json" ] && [ -s "dependency_track_findings.json" ]; then
+                  FINDINGS_COUNT=$(cat dependency_track_findings.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    print(len(data) if isinstance(data, list) else 0)
+except:
+    print(0)
+" 2>/dev/null || echo 0)
+
+                  echo "✅ Retrieved $FINDINGS_COUNT vulnerability findings from Dependency-Track"
+
+                  # Count severity levels
+                  CRITICAL_COUNT=$(cat dependency_track_findings.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    count = 0
+    for item in data:
+        if isinstance(item, dict) and item.get('vulnerability', {}).get('severity', '').upper() == 'CRITICAL':
+            count += 1
+    print(count)
+except:
+    print(0)
+" 2>/dev/null || echo 0)
+
+                  HIGH_COUNT=$(cat dependency_track_findings.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    count = 0
+    for item in data:
+        if isinstance(item, dict) and item.get('vulnerability', {}).get('severity', '').upper() == 'HIGH':
+            count += 1
+    print(count)
+except:
+    print(0)
+" 2>/dev/null || echo 0)
+
+                  MEDIUM_COUNT=$(cat dependency_track_findings.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    count = 0
+    for item in data:
+        if isinstance(item, dict) and item.get('vulnerability', {}).get('severity', '').upper() == 'MEDIUM':
+            count += 1
+    print(count)
+except:
+    print(0)
+" 2>/dev/null || echo 0)
+
+                  echo "📈 Vulnerability Summary:"
+                  echo "   🔴 CRITICAL: $CRITICAL_COUNT"
+                  echo "   🟠 HIGH: $HIGH_COUNT"
+                  echo "   🟡 MEDIUM: $MEDIUM_COUNT"
+                  echo "   📊 Total: $FINDINGS_COUNT"
+
+                  # Set outputs
+                  echo "::set-output name=project-uuid::$PROJECT_UUID"
+                  echo "::set-output name=findings-count::$FINDINGS_COUNT"
+                  echo "::set-output name=analysis-status::completed"
+
+                else
+                  echo "⚠️  No findings retrieved from Dependency-Track"
+                  echo '{"findings": []}' > dependency_track_findings.json
+                  echo "::set-output name=project-uuid::$PROJECT_UUID"
+                  echo "::set-output name=findings-count::0"
+                  echo "::set-output name=analysis-status::completed"
+                fi
+              else
+                echo "⚠️  Failed to retrieve findings (HTTP $FINDINGS_HTTP_CODE)"
+                echo "::set-output name=project-uuid::$PROJECT_UUID"
+                echo "::set-output name=findings-count::0"
+                echo "::set-output name=analysis-status::partial"
+              fi
+            else
+              echo "⚠️  Could not extract project UUID from response"
+              echo "::set-output name=analysis-status::completed"
+            fi
+          fi
+
+        else
+          echo "❌ Failed to submit SBOM to Dependency-Track (HTTP $HTTP_CODE)"
+          if [ -f "dt_response.json" ]; then
+            echo "Response: $(cat dt_response.json)"
+          fi
+          echo "::set-output name=analysis-status::failed"
+          exit 1
+        fi
+
+        echo "🎉 Dependency-Track integration completed successfully!"
+
+    - name: 📤 Upload Dependency-Track Artifacts
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: dependency-track-results
+        path: |
+          dependency_track_findings.json
+          dt_response.json
+        retention-days: 30

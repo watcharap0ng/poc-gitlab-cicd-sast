@@ -1,0 +1,310 @@
+# Gitleaks Configuration
+# Custom configuration for detecting secrets and sensitive information
+
+title = "Gitleaks Configuration - Enterprise Security"
+
+# Extend default rules and add custom rules
+[extend]
+useDefault = true
+
+# Custom rules for enterprise security
+[[rules]]
+description = "GitHub Personal Access Token"
+id = "github-pat"
+regex = '''ghp_[a-zA-Z0-9]{36}'''
+keywords = ["ghp_"]
+
+[[rules]]
+description = "GitHub OAuth App Token"
+id = "github-oauth"
+regex = '''gho_[a-zA-Z0-9]{36}'''
+keywords = ["gho_"]
+
+[[rules]]
+description = "GitHub App Token"
+id = "github-app"
+regex = '''ghu_[a-zA-Z0-9]{36}'''
+keywords = ["ghu_"]
+
+[[rules]]
+description = "GitHub Refresh Token"
+id = "github-refresh"
+regex = '''ghr_[a-zA-Z0-9]{36}'''
+keywords = ["ghr_"]
+
+[[rules]]
+description = "GitHub Fine-grained Token"
+id = "github-fine-grained"
+regex = '''github_pat_[a-zA-Z0-9_]{82}'''
+keywords = ["github_pat_"]
+
+[[rules]]
+description = "AWS Access Key ID"
+id = "aws-access-key"
+regex = '''AKIA[0-9A-Z]{16}'''
+keywords = ["AKIA"]
+
+[[rules]]
+description = "AWS Secret Access Key"
+id = "aws-secret-key"
+regex = '''(?i)aws.?secret.?access.?key.?[\\s=\":]+[a-zA-Z0-9/+=]{40}'''
+keywords = ["aws", "secret", "access", "key"]
+
+[[rules]]
+description = "Google Cloud Service Account Key"
+id = "gcp-sa-key"
+regex = '''\"type\": \"service_account\"'''
+keywords = ["type", "service_account"]
+
+[[rules]]
+description = "Azure Storage Account Key"
+id = "azure-storage-key"
+regex = '''[a-zA-Z0-9+/]{88}=='''
+keywords = ["DefaultEndpointsProtocol"]
+
+[[rules]]
+description = "Slack Bot Token"
+id = "slack-bot-token"
+regex = '''xoxb-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9-]{24}'''
+keywords = ["xoxb-"]
+
+[[rules]]
+description = "Slack User Token"
+id = "slack-user-token"
+regex = '''xoxp-[0-9]{10,13}-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9-]{24}'''
+keywords = ["xoxp-"]
+
+[[rules]]
+description = "Slack App Token"
+id = "slack-app-token"
+regex = '''xapp-[0-9]{11}-[0-9]{11}-[a-zA-Z0-9-]{24}'''
+keywords = ["xapp-"]
+
+[[rules]]
+description = "Jira API Token"
+id = "jira-api-token"
+regex = '''[0-9]{3}@[0-9A-F]{16}'''
+keywords = ["@"]
+
+[[rules]]
+description = "Twilio API Key"
+id = "twilio-api-key"
+regex = '''SK[0-9a-fA-F]{32}'''
+keywords = ["SK"]
+
+[[rules]]
+description = "SendGrid API Key"
+id = "sendgrid-api-key"
+regex = '''SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43}'''
+keywords = ["SG."]
+
+[[rules]]
+description = "Stripe API Key"
+id = "stripe-api-key"
+regex = '''sk_live_[0-9a-zA-Z]{24}'''
+keywords = ["sk_live_"]
+
+[[rules]]
+description = "Stripe Test Key"
+id = "stripe-test-key"
+regex = '''sk_test_[0-9a-zA-Z]{24}'''
+keywords = ["sk_test_"]
+
+[[rules]]
+description = "NPM Token"
+id = "npm-token"
+regex = '''npm_[a-zA-Z0-9_-]{36}'''
+keywords = ["npm_"]
+
+[[rules]]
+description = "Docker Hub Personal Access Token"
+id = "docker-hub-token"
+regex = '''dckr_pat_[a-zA-Z0-9_-]{95}'''
+keywords = ["dckr_pat_"]
+
+[[rules]]
+description = "Private Key - RSA"
+id = "private-key-rsa"
+regex = '''-----BEGIN RSA PRIVATE KEY-----'''
+keywords = ["-----BEGIN RSA PRIVATE KEY-----"]
+
+[[rules]]
+description = "Private Key - OpenSSH"
+id = "private-key-openssh"
+regex = '''-----BEGIN OPENSSH PRIVATE KEY-----'''
+keywords = ["-----BEGIN OPENSSH PRIVATE KEY-----"]
+
+[[rules]]
+description = "Private Key - DSA"
+id = "private-key-dsa"
+regex = '''-----BEGIN DSA PRIVATE KEY-----'''
+keywords = ["-----BEGIN DSA PRIVATE KEY-----"]
+
+[[rules]]
+description = "Private Key - EC"
+id = "private-key-ec"
+regex = '''-----BEGIN EC PRIVATE KEY-----'''
+keywords = ["-----BEGIN EC PRIVATE KEY-----"]
+
+[[rules]]
+description = "Private Key - PKCS8"
+id = "private-key-pkcs8"
+regex = '''-----BEGIN PRIVATE KEY-----'''
+keywords = ["-----BEGIN PRIVATE KEY-----"]
+
+[[rules]]
+description = "Certificate"
+id = "certificate"
+regex = '''-----BEGIN CERTIFICATE-----'''
+keywords = ["-----BEGIN CERTIFICATE-----"]
+
+[[rules]]
+description = "Database Connection String - Generic"
+id = "db-connection-generic"
+regex = '''(?i)(mysql|postgresql|mongodb|redis):\/\/[a-zA-Z0-9_\-\.@:\/]+'''
+keywords = ["mysql://", "postgresql://", "mongodb://", "redis://"]
+
+[[rules]]
+description = "Database Connection String - SQL Server"
+id = "db-connection-sqlserver"
+regex = '''(?i)server=[a-zA-Z0-9_\-\.]+;.*database=[a-zA-Z0-9_\-]+;'''
+keywords = ["server=", "database="]
+
+[[rules]]
+description = "API Key - Generic Pattern"
+id = "api-key-generic"
+regex = '''(?i)(api[_-]?key|apikey|secret|token)[\s=:\"']+([a-zA-Z0-9_\-]{16,})'''
+keywords = ["api_key", "apikey", "secret", "token"]
+
+[[rules]]
+description = "JWT Token"
+id = "jwt-token"
+regex = '''eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*'''
+keywords = ["eyJ"]
+
+[[rules]]
+description = "Email and Password Combination"
+id = "email-password"
+regex = '''[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[\s:=]+[a-zA-Z0-9@#$%^&*]{8,}'''
+keywords = ["@", ".com", ".org", ".net"]
+
+[[rules]]
+description = "Base64 Encoded Potential Secret"
+id = "base64-secret"
+regex = '''[a-zA-Z0-9+/]{40,}={0,2}'''
+keywords = ["base64"]
+
+# Allowlist configurations
+[allowlist]
+description = "Global Allowlist"
+paths = [
+    '''\.git''',
+    '''\.github''',
+    '''node_modules''',
+    '''dist''',
+    '''build''',
+    '''coverage''',
+    '''\.vscode''',
+    '''\.idea''',
+    '''\.DS_Store''',
+    '''Thumbs\.db'''
+]
+
+# Allow specific files and patterns
+files = [
+    '''\.md$''',
+    '''\.txt$''',
+    '''\.log$''',
+    '''\.tmp$''',
+    '''test_.*\.js$''',
+    '''spec_.*\.js$''',
+    '''mock.*\.js$''',
+    '''fixture.*\.js$'''
+]
+
+# Allow specific regex patterns (false positives)
+regexes = [
+    '''AKIAEXAMPLE''',      # Example AWS keys in documentation
+    '''ghp_exampletoken''', # Example GitHub tokens
+    '''sk_test_example''',  # Example Stripe keys
+    '''xoxb-example''',     # Example Slack tokens
+    '''example\.com''',     # Example domains
+    '''localhost''',        # Local development
+    '''127\.0\.0\.1''',     # Localhost IP
+    '''test_.*''',          # Test data
+    '''mock_.*''',          # Mock data
+    '''fake_.*''',          # Fake data
+    '''demo_.*'''           # Demo data
+]
+
+# Target specific paths for scanning
+[target]
+path = "."
+# Add specific paths to scan or exclude
+# exclude-paths = [
+#     "vendor/",
+#     "*.min.js",
+#     "*.bundle.js"
+# ]
+
+# Report configuration
+[report]
+output = "gitleaks.sarif"
+format = "sarif"
+
+# Additional custom rules for Node.js and modern development tools
+[[rules]]
+description = "Semgrep App Token"
+id = "semgrep-app-token"
+regex = '''s[gp]_[a-zA-Z0-9_-]{30,}'''
+keywords = ["sfp_", "sgp_"]
+tags = ["semgrep", "app", "token"]
+
+[[rules]]
+description = "Snyk Token"
+id = "snyk-token"
+regex = '''[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'''
+keywords = ["snyk"]
+tags = ["snyk", "token"]
+
+[[rules]]
+description = "DefectDojo API Key"
+id = "defectdojo-api-key"
+regex = '''(?i)defectdojo[_\s]?api[_\s]?key[\s=:]+["']?[a-zA-Z0-9_-]{20,}["']?'''
+keywords = ["defectdojo", "api", "key"]
+tags = ["defectdojo", "api", "key"]
+
+[[rules]]
+description = "Dependency-Track API Key"
+id = "dependency-track-api-key"
+regex = '''(?i)dependency[_\-]?track[_\s]?api[_\s]?key[\s=:]+["']?[a-zA-Z0-9_-]{20,}["']?'''
+keywords = ["dependency", "track", "api", "key"]
+tags = ["dependency-track", "api", "key"]
+
+[[rules]]
+description = "npm registry auth token"
+id = "npm-auth-token"
+regex = '''_authToken[\s=:]+["']?[a-zA-Z0-9_-]{24,}["']?'''
+keywords = ["_authToken", "npm"]
+tags = ["npm", "auth", "token"]
+
+[[rules]]
+description = "Docker Hub Token"
+id = "docker-hub-token"
+regex = '''dckr_pat_[a-zA-Z0-9_-]{30,}'''
+keywords = ["dckr_pat_"]
+tags = ["docker", "hub", "token"]
+
+[[rules]]
+description = "Kubernetes Service Account Token"
+id = "k8s-service-account-token"
+regex = '''eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9[a-zA-Z0-9._-]{400,}'''
+keywords = ["eyJ"]
+tags = ["kubernetes", "service-account", "token"]
+
+# Additional configuration options
+[options]
+max-depth = 100
+verbose = true
+no-banner = false
+redact = true

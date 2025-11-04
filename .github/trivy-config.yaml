@@ -1,0 +1,195 @@
+# Trivy Configuration for GitHub Actions
+# Enhanced security scanning configuration
+
+# Scan settings
+scan:
+  # Scan types to perform
+  types:
+    - vuln      # Vulnerability scanning
+    - misconfig  # Misconfiguration detection
+    - secret     # Secret detection
+    - license    # License scanning
+
+  # Severity levels to report
+  severity:
+    - UNKNOWN
+    - LOW
+    - MEDIUM
+    - HIGH
+    - CRITICAL
+
+  # Vulnerability database
+  db:
+    # Download vulnerability database
+    download: true
+    # Skip update if DB was downloaded within this duration
+    skip-update: 24h
+    # Repository for vulnerability database
+    repository: "ghcr.io/aquasecurity/trivy-db:2"
+
+# Secret scanning configuration
+secret:
+  # Enable secret scanning
+  enable: true
+  # Config file for secret scanning (Gitleaks format)
+  config: .github/gitleaks.toml
+
+# Misconfiguration scanning
+misconfig:
+  # Enable misconfiguration scanning
+  enable: true
+  # Policy files for custom misconfiguration checks
+  policies:
+    - .github/trivy-policies/
+
+# License scanning
+license:
+  # Enable license scanning
+  enable: true
+  # License categories to check
+  categories:
+    - forbidden
+    - restricted
+  - # Custom license configuration
+  custom-licenses:
+    - MIT
+    - Apache-2.0
+    - BSD-3-Clause
+    - ISC
+
+# Output configuration
+output:
+  # Default output format
+  format: sarif
+  # Output file path
+  file: trivy-results.sarif
+  # Include license information in output
+  include-licenses: true
+  # Show suppressed vulnerabilities
+  show-suppressed: false
+
+# Exclusion patterns
+exclude:
+  # Files and directories to exclude from scanning
+  paths:
+    - .git
+    - .github
+    - node_modules
+    - dist
+    - build
+    - coverage
+    - .vscode
+    - .idea
+    - .DS_Store
+    - Thumbs.db
+    - "*.min.js"
+    - "*.min.css"
+    - "*.bundle.js"
+    - "*.bundle.css"
+    - package-lock.json
+    - yarn.lock
+    - Gemfile.lock
+    - Pipfile.lock
+    - .terraform
+    - terraform.tfstate
+    - .terraform.lock.hcl
+
+  # Vulnerability IDs to exclude
+  cves:
+    - "CVE-2021-44228"  # Log4j (example)
+    - "CVE-2021-45046"  # Log4j (example)
+
+  # License IDs to exclude
+  licenses:
+    - "MIT"
+    - "Apache-2.0"
+    - "BSD-3-Clause"
+    - "ISC"
+
+# Image scanning specific settings
+image:
+  # Docker socket path
+  socket: /var/run/docker.sock
+  # Image scan timeout
+  timeout: 5m
+  # Scan all layers
+  all-layers: true
+  # Scan removed packages
+  removed-pkgs: true
+
+# Filesystem scanning specific settings
+fs:
+  # Scan file system recursively
+  recursive: true
+  # Follow symbolic links
+  follow-symlinks: false
+  # Scan hidden files
+  scan-hidden: true
+  # Skip directories
+  skip-dirs:
+    - .git
+    - .svn
+    - .hg
+    - .bzr
+    - node_modules
+    - .npm
+    - .cache
+    - tmp
+    - temp
+
+# Reporting and filtering
+filter:
+  # Filter by severity
+  severity:
+    min: "LOW"
+  # Filter by CVSS score
+  cvss:
+    min: 0.0
+  # Filter by package type
+  package-types:
+    - os
+    - library
+  # Exclude vulnerabilities with no fixed version
+  unfixed: false
+
+# Cache configuration
+cache:
+  # Enable caching
+  enable: true
+  # Cache directory
+  dir: /tmp/trivy-cache
+  # Cache TTL
+  ttl: 24h
+
+# GitHub Actions specific settings
+github:
+  # Enable GitHub Dependency Graph integration
+  dependency-graph: true
+  # Enable GitHub Code Scanning integration
+  code-scanning: true
+  # Upload results to GitHub Security tab
+  upload-results: true
+  # PR comment for findings
+  pr-comment: true
+  # Fail workflow on critical findings
+  fail-on-critical: true
+  # Fail workflow on high findings
+  fail-on-high: false
+
+# Performance settings
+performance:
+  # Number of parallel workers
+  workers: 4
+  # Memory limit (MB)
+  memory-limit: 1024
+  # CPU limit (number of cores)
+  cpu-limit: 2
+
+# Logging
+logging:
+  # Log level (debug, info, warn, error)
+  level: info
+  # Log format (text, json)
+  format: text
+  # Enable colored output
+  colored: true

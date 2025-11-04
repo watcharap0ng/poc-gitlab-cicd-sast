@@ -1,0 +1,585 @@
+name: ⚡ Performance Optimization and Monitoring
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6 AM UTC
+  workflow_dispatch:
+    inputs:
+      test_type:
+        description: 'Performance test type'
+        required: true
+        default: 'load'
+        type: choice
+        options:
+          - load
+          - stress
+          - spike
+          - endurance
+      duration:
+        description: 'Test duration in minutes'
+        required: false
+        default: '10'
+        type: string
+
+env:
+  NODE_VERSION: '18'
+  ARTILLERY_VERSION: '2.0.0'
+  K6_VERSION: 'v0.46.0'
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+
+jobs:
+  # ===========================================
+  # PERFORMANCE TEST MATRIX
+  # ===========================================
+  performance-test-matrix:
+    name: Performance Test Suite
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        test-type: [load, stress, spike]
+        include:
+          - test-type: load
+            duration: 10
+            target-url: https://staging.example.com
+            vus: 10
+          - test-type: stress
+            duration: 15
+            target-url: https://staging.example.com
+            vus: 50
+          - test-type: spike
+            duration: 5
+            target-url: https://staging.example.com
+            vus: 100
+      max-parallel: 2
+
+    outputs:
+      test-results: ${{ steps.results.outputs.json }}
+      performance-score: ${{ steps.results.outputs.score }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Cache Performance Test Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            node_modules
+            performance-test/node_modules
+          key: ${{ runner.os }}-perf-test-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-perf-test-
+            ${{ runner.os }}-node-
+
+      - name: Install Performance Testing Tools
+        run: |
+          npm install -g artillery@${{ env.ARTILLERY_VERSION }}
+          npm install -g k6@${{ env.K6_VERSION }}
+          npm ci --prefix performance-test
+
+      - name: Prepare Test Environment
+        run: |
+          echo "🔧 Preparing performance test environment..."
+
+          # Create test configuration
+          cat > test-config-${{ matrix.test-type }}.yml << 'EOF'
+          config:
+            target: '${{ matrix.target-url }}'
+            phases:
+              - duration: ${{ matrix.duration }}
+                arrivalRate: ${{ matrix.vus }}
+            processor: './test-processor.js'
+          scenarios:
+            - name: "API Load Test"
+              weight: 70
+              flow:
+                - get:
+                    url: "/api/health"
+                - think: 1
+                - post:
+                    url: "/api/data"
+                    json:
+                      test: "performance"
+            - name: "Web Page Load Test"
+              weight: 30
+              flow:
+                - get:
+                    url: "/"
+                - think: 2
+                - get:
+                    url: "/dashboard"
+          EOF
+
+          echo "✅ Test configuration prepared"
+
+      - name: Warm-up Phase
+        run: |
+          echo "🔥 Warming up target application..."
+
+          # Health check
+          curl -f ${{ matrix.target-url }}/health || {
+            echo "❌ Target application is not healthy"
+            exit 1
+          }
+
+          # Warm-up requests
+          for i in {1..10}; do
+            curl -s ${{ matrix.target-url }}/ > /dev/null
+            sleep 0.5
+          done
+
+          echo "✅ Warm-up completed"
+
+      - name: Execute Performance Test
+        id: test
+        run: |
+          echo "🚀 Starting ${{ matrix.test-type }} performance test..."
+
+          # Run Artillery test
+          artillery run test-config-${{ matrix.test-type }}.yml \
+            --target ${{ matrix.target-url }} \
+            --output artillery-results-${{ matrix.test-type }}.json
+
+          # Run K6 test
+          k6 run --out json=k6-results-${{ matrix.test-type }}.json \
+            --duration ${{ matrix.duration }}m \
+            --vus ${{ matrix.vus }} \
+            performance-test/k6-${{ matrix.test-type }}-test.js
+
+          echo "✅ Performance test completed"
+
+      - name: Analyze Test Results
+        id: results
+        run: |
+          echo "📊 Analyzing performance test results..."
+
+          # Process Artillery results
+          node performance-test/analyze-results.js \
+            artillery-results-${{ matrix.test-type }}.json \
+            k6-results-${{ matrix.test-type }}.json \
+            > performance-report-${{ matrix.test-type }}.json
+
+          # Extract key metrics
+          RESPONSE_TIME=$(jq -r '.aggregate.responseTimes.mean' performance-report-${{ matrix.test-type }}.json)
+          RPS=$(jq -r '.aggregate.rps.mean' performance-report-${{ matrix.test-type }}.json)
+          ERROR_RATE=$(jq -r '.aggregate.errors' performance-report-${{ matrix.test-type }}.json)
+
+          echo "Response Time: ${RESPONSE_TIME}ms"
+          echo "Requests/sec: ${RPS}"
+          echo "Error Rate: ${ERROR_RATE}%"
+
+          # Calculate performance score
+          SCORE=$(node performance-test/calculate-score.js $RESPONSE_TIME $RPS $ERROR_RATE)
+          echo "Performance Score: $SCORE/100"
+
+          echo "score=$SCORE" >> $GITHUB_OUTPUT
+          echo "json=$(cat performance-report-${{ matrix.test-type }}.json)" >> $GITHUB_OUTPUT
+
+          echo "✅ Results analysis completed"
+
+      - name: Generate Performance Report
+        run: |
+          echo "📋 Generating performance report..."
+
+          # Generate HTML report
+          node performance-test/generate-html-report.js \
+            performance-report-${{ matrix.test-type }}.json \
+            > performance-report-${{ matrix.test-type }}.html
+
+          # Generate PDF report
+          if command -v puppeteer &> /dev/null; then
+            node performance-test/generate-pdf-report.js \
+              performance-report-${{ matrix.test-type }}.html \
+              performance-report-${{ matrix.test-type }}.pdf
+          fi
+
+          echo "✅ Performance report generated"
+
+      - name: Performance Gate Check
+        run: |
+          echo "🚪 Checking performance gates..."
+
+          RESPONSE_TIME=$(jq -r '.aggregate.responseTimes.mean' performance-report-${{ matrix.test-type }}.json)
+          RPS=$(jq -r '.aggregate.rps.mean' performance-report-${{ matrix.test-type }}.json)
+          ERROR_RATE=$(jq -r '.aggregate.errors' performance-report-${{ matrix.test-type }}.json)
+
+          # Define thresholds
+          MAX_RESPONSE_TIME=1000  # 1 second
+          MIN_RPS=50  # 50 requests per second
+          MAX_ERROR_RATE=1  # 1% error rate
+
+          echo "Checking thresholds:"
+          echo "  Response Time: ${RESPONSE_TIME}ms (max: ${MAX_RESPONSE_TIME}ms)"
+          echo "  RPS: ${RPS} (min: ${MIN_RPS})"
+          echo "  Error Rate: ${ERROR_RATE}% (max: ${MAX_ERROR_RATE}%)"
+
+          # Check thresholds
+          if (( $(echo "$RESPONSE_TIME > $MAX_RESPONSE_TIME" | bc -l) )); then
+            echo "❌ Response time exceeds threshold"
+            exit 1
+          fi
+
+          if (( $(echo "$RPS < $MIN_RPS" | bc -l) )); then
+            echo "❌ RPS below threshold"
+            exit 1
+          fi
+
+          if (( $(echo "$ERROR_RATE > $MAX_ERROR_RATE" | bc -l) )); then
+            echo "❌ Error rate exceeds threshold"
+            exit 1
+          fi
+
+          echo "✅ All performance gates passed"
+
+      - name: Upload Performance Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-test-${{ matrix.test-type }}
+          path: |
+            artillery-results-${{ matrix.test-type }}.json
+            k6-results-${{ matrix.test-type }}.json
+            performance-report-${{ matrix.test-type }}.json
+            performance-report-${{ matrix.test-type }}.html
+            performance-report-${{ matrix.test-type }}.pdf
+          retention-days: 30
+
+      - name: Comment PR with Performance Results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const results = JSON.parse(fs.readFileSync(`performance-report-${{ matrix.test-type }}.json`, 'utf8'));
+
+            const comment = `
+            ## 🚀 Performance Test Results (${{ matrix.test-type }})
+
+            **Test Configuration:**
+            - Duration: ${{ matrix.duration }} minutes
+            - Virtual Users: ${{ matrix.vus }}
+            - Target: ${{ matrix.target-url }}
+
+            **Key Metrics:**
+            - Average Response Time: ${results.aggregate.responseTimes.mean}ms
+            - Requests per Second: ${results.aggregate.rps.mean}
+            - Error Rate: ${results.aggregate.errors}%
+            - Performance Score: ${{ steps.results.outputs.score }}/100
+
+            **Full Report:** [View Detailed Results](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+  # ===========================================
+  # BUNDLE SIZE ANALYSIS
+  # ===========================================
+  bundle-size-analysis:
+    name: Bundle Size Analysis
+    runs-on: ubuntu-latest
+    outputs:
+      bundle-size: ${{ steps.bundle.outputs.size }}
+      size-change: ${{ steps.bundle.outputs.change }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Get full history for comparison
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci --prefer-offline
+
+      - name: Analyze Bundle Size
+        id: bundle
+        run: |
+          echo "📦 Analyzing bundle size..."
+
+          # Build application
+          npm run build
+
+          # Analyze bundle size
+          npx bundlesize --format json > bundle-size-results.json
+
+          # Extract total size
+          TOTAL_SIZE=$(jq -r '.totalSize' bundle-size-results.json)
+          echo "Current bundle size: ${TOTAL_SIZE} bytes"
+
+          # Compare with base branch
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            git fetch origin ${{ github.base_ref }}
+            git checkout ${{ github.base_ref }}
+            npm ci --prefer-offline
+            npm run build
+            npx bundlesize --format json > base-bundle-size.json
+
+            BASE_SIZE=$(jq -r '.totalSize' base-bundle-size.json)
+            SIZE_CHANGE=$((TOTAL_SIZE - BASE_SIZE))
+            CHANGE_PERCENT=$((SIZE_CHANGE * 100 / BASE_SIZE))
+
+            echo "Base bundle size: ${BASE_SIZE} bytes"
+            echo "Size change: ${SIZE_CHANGE} bytes (${CHANGE_PERCENT}%)"
+
+            echo "size=$TOTAL_SIZE" >> $GITHUB_OUTPUT
+            echo "change=$SIZE_CHANGE" >> $GITHUB_OUTPUT
+          else
+            echo "size=$TOTAL_SIZE" >> $GITHUB_OUTPUT
+            echo "change=0" >> $GITHUB_OUTPUT
+          fi
+
+          echo "✅ Bundle size analysis completed"
+
+      - name: Bundle Size Gate Check
+        run: |
+          echo "🚪 Checking bundle size gates..."
+
+          MAX_SIZE=5242880  # 5MB
+          SIZE_CHANGE=${{ steps.bundle.outputs.change }}
+
+          if [ "${{ steps.bundle.outputs.size }}" -gt "$MAX_SIZE" ]; then
+            echo "❌ Bundle size exceeds maximum allowed size ($MAX_SIZE bytes)"
+            exit 1
+          fi
+
+          if [ "$SIZE_CHANGE" -gt 524288 ]; then  # 512KB increase
+            echo "⚠️ Bundle size increased significantly (+${SIZE_CHANGE} bytes)"
+          fi
+
+          echo "✅ Bundle size gates passed"
+
+      - name: Generate Bundle Size Report
+        run: |
+          # Create detailed bundle analysis
+          npx webpack-bundle-analyzer dist/static/js/*.js \
+            --mode static \
+            --report bundle-analysis.html
+
+          echo "✅ Bundle analysis report generated"
+
+      - name: Upload Bundle Analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-analysis
+          path: |
+            bundle-size-results.json
+            bundle-analysis.html
+          retention-days: 30
+
+  # ===========================================
+  # Lighthouse PERFORMANCE AUDIT
+  # ===========================================
+  lighthouse-audit:
+    name: Lighthouse Performance Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: |
+          npm ci --prefer-offline
+          npm install -g @lhci/cli@0.12.x
+
+      - name: Build Application
+        run: npm run build
+
+      - name: Run Lighthouse CI
+        run: |
+          echo "🔍 Running Lighthouse performance audit..."
+
+          # Configure Lighthouse CI
+          cat > lighthouserc.js << 'EOF'
+          module.exports = {
+            ci: {
+              collect: {
+                url: ['http://localhost:3000'],
+                startServerCommand: 'npm start',
+                startServerReadyPattern: 'Server running',
+                numberOfRuns: 3
+              },
+              assert: {
+                assertions: {
+                  'categories:performance': ['warn', {minScore: 0.9}],
+                  'categories:accessibility': ['error', {minScore: 0.9}],
+                  'categories:best-practices': ['warn', {minScore: 0.9}],
+                  'categories:seo': ['warn', {minScore: 0.9}],
+                  'categories:pwa': 'off'
+                }
+              },
+              upload: {
+                target: 'temporary-public-storage'
+              }
+            }
+          };
+          EOF
+
+          # Run Lighthouse CI
+          lhci autorun
+
+          echo "✅ Lighthouse audit completed"
+
+      - name: Process Lighthouse Results
+        run: |
+          # Extract key metrics from Lighthouse results
+          jq -r '.[0].lhr.categories.performance.score * 100' .lighthouseci/lhr-*.json > performance-score.txt
+          jq -r '.[0].lhr.audits["largest-contentful-paint"].numericValue' .lighthouseci/lhr-*.json > lcp.txt
+          jq -r '.[0].lhr.audits["first-contentful-paint"].numericValue' .lighthouseci/lhr-*.json > fcp.txt
+          jq -r '.[0].lhr.audits["cumulative-layout-shift"].numericValue' .lighthouseci/lhr-*.json > cls.txt
+
+          echo "Performance Score: $(cat performance-score.txt)"
+          echo "LCP: $(cat lcp.txt)ms"
+          echo "FCP: $(cat fcp.txt)ms"
+          echo "CLS: $(cat cls.txt)"
+
+      - name: Upload Lighthouse Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: lighthouse-results
+          path: |
+            .lighthouseci/
+            performance-score.txt
+            lcp.txt
+            fcp.txt
+            cls.txt
+          retention-days: 30
+
+  # ===========================================
+  # PERFORMANCE TREND ANALYSIS
+  # ===========================================
+  trend-analysis:
+    name: Performance Trend Analysis
+    runs-on: ubuntu-latest
+    needs: [performance-test-matrix, bundle-size-analysis, lighthouse-audit]
+    if: always()
+
+    steps:
+      - name: Download All Performance Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*"
+          merge-multiple: true
+
+      - name: Generate Comprehensive Performance Report
+        run: |
+          echo "📊 Generating comprehensive performance report..."
+
+          # Create performance dashboard
+          cat > performance-dashboard.md << 'EOF'
+          # Performance Dashboard
+
+          ## Test Execution Summary
+          - **Date**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          - **Repository**: ${{ github.repository }}
+          - **Commit**: ${{ github.sha }}
+          - **Branch**: ${{ github.ref_name }}
+
+          ## Performance Test Results
+          EOF
+
+          # Add results from each test type
+          for test_type in load stress spike; do
+            if [ -f "performance-report-${test_type}.json" ]; then
+              echo "### ${test_type^} Test Results" >> performance-dashboard.md
+              jq -r '"- Average Response Time: \(.aggregate.responseTimes.mean)ms"' performance-report-${test_type}.json >> performance-dashboard.md
+              jq -r '"- Requests per Second: \(.aggregate.rps.mean)"' performance-report-${test_type}.json >> performance-dashboard.md
+              jq -r '"- Error Rate: \(.aggregate.errors)%"' performance-report-${test_type}.json >> performance-dashboard.md
+              echo "" >> performance-dashboard.md
+            fi
+          done
+
+          # Add bundle size information
+          if [ -f "bundle-size-results.json" ]; then
+            echo "## Bundle Size Analysis" >> performance-dashboard.md
+            jq -r '"- Total Bundle Size: \(.totalSize) bytes"' bundle-size-results.json >> performance-dashboard.md
+            echo "" >> performance-dashboard.md
+          fi
+
+          # Add Lighthouse results
+          if [ -f "performance-score.txt" ]; then
+            echo "## Lighthouse Performance Score" >> performance-dashboard.md
+            echo "- Performance Score: $(cat performance-score.txt)/100" >> performance-dashboard.md
+            echo "" >> performance-dashboard.md
+          fi
+
+          echo "✅ Performance dashboard generated"
+
+      - name: Update Performance Trends
+        run: |
+          echo "📈 Updating performance trends..."
+
+          # Store results in a trends file
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Create or update trends data
+          if [ -f "performance-trends.json" ]; then
+            # Append new data point
+            jq ". += [{\"timestamp\": \"$TIMESTAMP\", \"commit\": \"${{ github.sha }}\", \"performance_score\": $(cat performance-score.txt 2>/dev/null || echo 0)}]" performance-trends.json > temp.json && mv temp.json performance-trends.json
+          else
+            # Create new trends file
+            echo "[{\"timestamp\": \"$TIMESTAMP\", \"commit\": \"${{ github.sha }}\", \"performance_score\": $(cat performance-score.txt 2>/dev/null || echo 0)}]" > performance-trends.json
+          fi
+
+          echo "✅ Performance trends updated"
+
+      - name: Upload Performance Dashboard
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-dashboard
+          path: |
+            performance-dashboard.md
+            performance-trends.json
+          retention-days: 90
+
+      - name: Slack Performance Report
+        if: github.ref == 'refs/heads/main'
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            📊 Performance testing completed for main branch!
+
+            **Repository**: ${{ github.repository }}
+            **Commit**: ${{ github.sha }}
+
+            **Key Metrics:**
+            - Bundle Size: ${{ needs.bundle-size-analysis.outputs.bundle-size }} bytes
+            - Size Change: ${{ needs.bundle-size-analysis.outputs.size-change }} bytes
+
+            📊 [View Full Report](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          channel: ${{ secrets.SLACK_PERFORMANCE_CHANNEL }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

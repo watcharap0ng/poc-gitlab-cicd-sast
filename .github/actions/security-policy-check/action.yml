@@ -1,0 +1,257 @@
+name: 'Security Policy Check'
+description: 'Validates security scan results against policy thresholds'
+inputs:
+  fail-on-high-critical:
+    description: 'Fail pipeline on HIGH/CRITICAL vulnerabilities'
+    required: false
+    default: 'true'
+  fail-on-medium:
+    description: 'Fail pipeline on MEDIUM vulnerabilities'
+    required: false
+    default: 'false'
+  reports-path:
+    description: 'Path to security reports directory'
+    required: false
+    default: '.'
+outputs:
+  status:
+    description: 'Policy check status'
+    value: ${{ steps.policy.outputs.status }}
+  high-critical:
+    description: 'Number of HIGH/CRITICAL vulnerabilities'
+    value: ${{ steps.policy.outputs.high-critical }}
+  medium:
+    description: 'Number of MEDIUM vulnerabilities'
+    value: ${{ steps.policy.outputs.medium }}
+  low:
+    description: 'Number of LOW vulnerabilities'
+    value: ${{ steps.policy.outputs.low }}
+  deployment-approved:
+    description: 'Whether deployment is approved'
+    value: ${{ steps.policy.outputs.deployment-approved }}
+runs:
+  using: 'composite'
+  steps:
+    - name: 🔒 Security Policy Validation
+      id: policy
+      shell: bash
+      run: |
+        # Configuration
+        FAIL_ON_HIGH_CRITICAL="${{ inputs.fail-on-high-critical }}"
+        FAIL_ON_MEDIUM="${{ inputs.fail-on-medium }}"
+        REPORTS_PATH="${{ inputs.reports-path }}"
+
+        # Initialize counters
+        HIGH_CRITICAL_COUNT=0
+        MEDIUM_COUNT=0
+        LOW_COUNT=0
+        TOTAL_FINDINGS=0
+
+        echo "🔒 Running Security Policy Check..."
+        echo "   Fail on HIGH/CRITICAL: $FAIL_ON_HIGH_CRITICAL"
+        echo "   Fail on MEDIUM: $FAIL_ON_MEDIUM"
+
+        # Function to analyze JSON report for vulnerabilities
+        analyze_report() {
+            local report_file=$1
+            local tool_name=$2
+
+            if [[ ! -f "$report_file" ]] || [[ ! -s "$report_file" ]]; then
+                echo "⚠️  $tool_name report not found or empty: $report_file"
+                return 0
+            fi
+
+            echo "📊 Analyzing $tool_name report..."
+
+            # Check if file is valid JSON
+            if ! python3 -c "import json; json.load(open('$report_file'))" 2>/dev/null; then
+                echo "⚠️  $tool_name report is not valid JSON, skipping..."
+                return 0
+            fi
+
+            # Count vulnerabilities by severity
+            local high_critical=$(python3 -c "
+import json, sys
+try:
+    with open('$report_file') as f:
+        data = json.load(f)
+
+    count = 0
+    if 'Results' in data:
+        for result in data['Results']:
+            if 'Vulnerabilities' in result:
+                for vuln in result['Vulnerabilities']:
+                    if vuln.get('Severity', '').upper() in ['HIGH', 'CRITICAL']:
+                        count += 1
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and 'metadata' in item:
+                severity = item.get('metadata', {}).get('severity', '').upper()
+                if severity in ['HIGH', 'CRITICAL']:
+                    count += 1
+    elif 'runs' in data:  # SARIF format
+        for run in data['runs']:
+            if 'results' in run:
+                for result in run['results']:
+                    level = result.get('level', '').upper()
+                    if level in ['ERROR', 'HIGH', 'CRITICAL']:
+                        count += 1
+    print(count)
+except:
+    print(0)
+" 2>/dev/null || echo 0)
+
+            local medium=$(python3 -c "
+import json, sys
+try:
+    with open('$report_file') as f:
+        data = json.load(f)
+
+    count = 0
+    if 'Results' in data:
+        for result in data['Results']:
+            if 'Vulnerabilities' in result:
+                for vuln in result['Vulnerabilities']:
+                    if vuln.get('Severity', '').upper() == 'MEDIUM':
+                        count += 1
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and 'metadata' in item:
+                severity = item.get('metadata', {}).get('severity', '').upper()
+                if severity == 'MEDIUM':
+                    count += 1
+    elif 'runs' in data:  # SARIF format
+        for run in data['runs']:
+            if 'results' in run:
+                for result in run['results']:
+                    level = result.get('level', '').upper()
+                    if level == 'MEDIUM':
+                        count += 1
+    print(count)
+except:
+    print(0)
+" 2>/dev/null || echo 0)
+
+            local low=$(python3 -c "
+import json, sys
+try:
+    with open('$report_file') as f:
+        data = json.load(f)
+
+    count = 0
+    if 'Results' in data:
+        for result in data['Results']:
+            if 'Vulnerabilities' in result:
+                for vuln in result['Vulnerabilities']:
+                    if vuln.get('Severity', '').upper() == 'LOW':
+                        count += 1
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and 'metadata' in item:
+                severity = item.get('metadata', {}).get('severity', '').upper()
+                if severity == 'LOW':
+                    count += 1
+    elif 'runs' in data:  # SARIF format
+        for run in data['runs']:
+            if 'results' in run:
+                for result in run['results']:
+                    level = result.get('level', '').upper()
+                    if level == 'NOTE' or level == 'INFO':
+                        count += 1
+    print(count)
+except:
+    print(0)
+" 2>/dev/null || echo 0)
+
+            HIGH_CRITICAL_COUNT=$((HIGH_CRITICAL_COUNT + high_critical))
+            MEDIUM_COUNT=$((MEDIUM_COUNT + medium))
+            LOW_COUNT=$((LOW_COUNT + low))
+
+            echo "   📋 $tool_name: HIGH/CRITICAL: $high_critical, MEDIUM: $medium, LOW: $low"
+
+            return 0
+        }
+
+        # Analyze all security reports
+        echo "🔍 Analyzing security scan results..."
+
+        # Look for various report formats
+        for report in gitleaks.sarif semgrep.sarif trivy-fs.sarif trivy-docker.sarif dependency-track-findings.json; do
+            if [[ -f "$report" ]]; then
+                tool_name=$(basename "$report" .sarif | sed 's/-/ /g' | sed 's/\b\w/\u&/g')
+                analyze_report "$report" "$tool_name"
+            fi
+        done
+
+        TOTAL_FINDINGS=$((HIGH_CRITICAL_COUNT + MEDIUM_COUNT + LOW_COUNT))
+
+        echo ""
+        echo "📊 Security Summary:"
+        echo "   🔴 HIGH/CRITICAL: $HIGH_CRITICAL_COUNT"
+        echo "   🟡 MEDIUM: $MEDIUM_COUNT"
+        echo "   🟢 LOW: $LOW_COUNT"
+        echo "   📈 Total Findings: $TOTAL_FINDINGS"
+
+        # Create security summary report
+        cat > security-summary.json << EOF
+{
+  "scan_summary": {
+    "high_critical_vulnerabilities": $HIGH_CRITICAL_COUNT,
+    "medium_vulnerabilities": $MEDIUM_COUNT,
+    "low_vulnerabilities": $LOW_COUNT,
+    "total_findings": $TOTAL_FINDINGS,
+    "scan_timestamp": "$(date -Iseconds)",
+    "commit_sha": "${{ github.sha }}",
+    "branch": "${{ github.ref_name }}",
+    "repository": "${{ github.repository }}"
+  },
+  "policy_config": {
+    "fail_on_high_critical": $FAIL_ON_HIGH_CRITICAL,
+    "fail_on_medium": $FAIL_ON_MEDIUM
+  }
+}
+EOF
+
+        echo ""
+        echo "🔒 Security Policy Check Results:"
+        echo "   Fail on HIGH/CRITICAL: $FAIL_ON_HIGH_CRITICAL"
+        echo "   Fail on MEDIUM: $FAIL_ON_MEDIUM"
+
+        # Determine if pipeline should fail
+        PIPELINE_SHOULD_FAIL=false
+        DEPLOYMENT_APPROVED=true
+
+        if [[ "$FAIL_ON_HIGH_CRITICAL" == "true" ]] && [[ $HIGH_CRITICAL_COUNT -gt 0 ]]; then
+            echo "   ❌ PIPELINE WILL FAIL: Found $HIGH_CRITICAL_COUNT HIGH/CRITICAL vulnerabilities"
+            PIPELINE_SHOULD_FAIL=true
+            DEPLOYMENT_APPROVED=false
+        fi
+
+        if [[ "$FAIL_ON_MEDIUM" == "true" ]] && [[ $MEDIUM_COUNT -gt 0 ]]; then
+            echo "   ❌ PIPELINE WILL FAIL: Found $MEDIUM_COUNT MEDIUM vulnerabilities"
+            PIPELINE_SHOULD_FAIL=true
+            DEPLOYMENT_APPROVED=false
+        fi
+
+        if [[ "$PIPELINE_SHOULD_FAIL" == "false" ]]; then
+            echo "   ✅ PIPELINE WILL CONTINUE: No policy violations detected"
+        fi
+
+        # Set outputs
+        echo "status=$(if [[ "$PIPELINE_SHOULD_FAIL" == "true" ]]; then echo 'failed'; else echo 'passed'; fi)" >> $GITHUB_OUTPUT
+        echo "high-critical=$HIGH_CRITICAL_COUNT" >> $GITHUB_OUTPUT
+        echo "medium=$MEDIUM_COUNT" >> $GITHUB_OUTPUT
+        echo "low=$LOW_COUNT" >> $GITHUB_OUTPUT
+        echo "deployment-approved=$DEPLOYMENT_APPROVED" >> $GITHUB_OUTPUT
+
+        echo ""
+        echo "📄 Security summary saved to security-summary.json"
+
+        # Exit with appropriate code
+        if [[ "$PIPELINE_SHOULD_FAIL" == "true" ]]; then
+            echo "❌ Security policy check FAILED"
+            exit 1
+        else
+            echo "✅ Security policy check PASSED"
+            exit 0
+        fi

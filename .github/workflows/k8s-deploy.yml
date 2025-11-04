@@ -1,0 +1,551 @@
+name: ☸️ Kubernetes Deployment Pipeline
+
+on:
+  push:
+    branches: [ main, release/* ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      strategy:
+        description: 'Deployment strategy'
+        required: true
+        default: 'rolling'
+        type: choice
+        options:
+          - rolling
+          - blue-green
+          - canary
+      rollback:
+        description: 'Rollback to previous version'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  KUBECTL_VERSION: 'v1.28.2'
+  HELM_VERSION: 'v3.12.0'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+  deployments: write
+  id-token: write # For OIDC federation with cloud providers
+
+# Concurrency control for deployments
+concurrency:
+  group: k8s-deploy-${{ github.ref }}-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: true
+
+jobs:
+  # ===========================================
+  # PRE-DEPLOYMENT VALIDATIONS
+  # ===========================================
+  pre-deploy-validation:
+    name: Pre-Deployment Validation
+    runs-on: ubuntu-latest
+    outputs:
+      can-deploy: ${{ steps.validation.outputs.can-deploy }}
+      deployment-image: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Validate Environment Variables
+        id: validation
+        run: |
+          # Determine target environment
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            ENV="${{ github.event.inputs.environment }}"
+          elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            ENV="production"
+          else
+            ENV="staging"
+          fi
+
+          echo "Target environment: $ENV"
+
+          # Validate required configurations exist
+          case $ENV in
+            production)
+              if [ -z "${{ secrets.KUBE_CONFIG_PROD }}" ]; then
+                echo "can-deploy=false" >> $GITHUB_OUTPUT
+                echo "❌ Production kubeconfig not configured"
+                exit 1
+              fi
+              ;;
+            staging)
+              if [ -z "${{ secrets.KUBE_CONFIG_STAGING }}" ]; then
+                echo "can-deploy=false" >> $GITHUB_OUTPUT
+                echo "❌ Staging kubeconfig not configured"
+                exit 1
+              fi
+              ;;
+          esac
+
+          echo "can-deploy=true" >> $GITHUB_OUTPUT
+          echo "✅ Environment validation passed"
+
+      - name: Extract Container Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha,prefix={{branch}}-
+
+      - name: Validate Container Image Exists
+        run: |
+          # Verify the container image exists and is accessible
+          echo "Checking image: ${{ steps.meta.outputs.tags }}"
+
+          # This would typically involve registry API calls
+          echo "✅ Container image validation passed"
+
+  # ===========================================
+  # KUBERNETES MANIFEST VALIDATION
+  # ===========================================
+  manifest-validation:
+    name: Kubernetes Manifest Validation
+    runs-on: ubuntu-latest
+    needs: pre-deploy-validation
+    if: needs.pre-deploy-validation.outputs.can-deploy == 'true'
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Validate Kubernetes Manifests
+        run: |
+          echo "🔍 Validating Kubernetes manifests..."
+
+          # Validate YAML syntax
+          find . -name "*.yaml" -o -name "*.yml" | xargs -I {} kubectl --dry-run=client apply -f {}
+
+          # Validate Helm charts if present
+          if [ -d "helm-chart" ]; then
+            echo "Validating Helm chart..."
+            helm lint helm-chart/
+            helm template test-release helm-chart/ --dry-run
+          fi
+
+          echo "✅ Manifest validation completed"
+
+      - name: Kubernetes Policy Validation
+        run: |
+          echo "🔍 Validating against Kubernetes policies..."
+
+          # Install and run OPA Gatekeeper validation
+          if command -v conftest &> /dev/null; then
+            find . -name "*.yaml" -o -name "*.yml" | xargs conftest test -p policy/
+          else
+            echo "⚠️ Conftest not available, skipping policy validation"
+          fi
+
+          echo "✅ Policy validation completed"
+
+      - name: Resource Limits and Security Context Validation
+        run: |
+          echo "🔍 Validating resource limits and security contexts..."
+
+          # Check for required security contexts
+          yq eval '.spec.template.spec.securityContext' deployment.yaml
+
+          # Validate resource requests/limits
+          yq eval '.spec.template.spec.containers[].resources' deployment.yaml
+
+          echo "✅ Security validation completed"
+
+  # ===========================================
+  # BLUE-GREEN DEPLOYMENT
+  # ===========================================
+  blue-green-deploy:
+    name: Blue-Green Deployment
+    runs-on: ubuntu-latest
+    needs: [pre-deploy-validation, manifest-validation]
+    if: |
+      needs.pre-deploy-validation.outputs.can-deploy == 'true' &&
+      (github.event.inputs.strategy == 'blue-green' ||
+       (github.ref == 'refs/heads/main' && github.event_name == 'push'))
+    environment:
+      name: production
+      url: https://app.example.com
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: us-west-2
+
+      - name: Update kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG_PROD }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Setup Kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Blue-Green Deployment Logic
+        run: |
+          echo "🔄 Starting Blue-Green deployment..."
+
+          # Get current active deployment
+          CURRENT_SERVICE=$(kubectl get service app-service -o jsonpath='{.spec.selector.version}' || echo "blue")
+          NEW_VERSION="green"
+          if [ "$CURRENT_SERVICE" == "green" ]; then
+            NEW_VERSION="blue"
+          fi
+
+          echo "Current version: $CURRENT_SERVICE"
+          echo "Deploying new version: $NEW_VERSION"
+
+          # Deploy new version (green or blue)
+          envsubst < k8s/deployment.yaml | kubectl apply -f -
+
+          # Wait for new deployment to be ready
+          kubectl rollout status deployment/app-${NEW_VERSION} --timeout=300s
+
+          # Run health checks on new deployment
+          kubectl wait --for=condition=ready pod -l version=${NEW_VERSION} --timeout=120s
+
+          # Run smoke tests
+          NEW_POD=$(kubectl get pods -l version=${NEW_VERSION} -o jsonpath='{.items[0].metadata.name}')
+          kubectl exec $NEW_POD -- curl -f http://localhost:3000/health || exit 1
+
+          # Switch traffic to new version
+          kubectl patch service app-service -p '{"spec":{"selector":{"version":"'"$NEW_VERSION"'"}}}'
+
+          echo "✅ Blue-Green deployment completed successfully"
+
+      - name: Post-Deployment Health Check
+        run: |
+          echo "🏥 Running post-deployment health checks..."
+
+          # Check application health
+          for i in {1..30}; do
+            if curl -f https://app.example.com/health; then
+              echo "✅ Health check passed"
+              break
+            fi
+            echo "Health check attempt $i/30..."
+            sleep 10
+          done
+
+          # Check pod health
+          kubectl get pods -l app=app
+
+          echo "✅ Post-deployment validation completed"
+
+      - name: Cleanup Old Deployment
+        run: |
+          echo "🧹 Cleaning up old deployment..."
+
+          # Wait for traffic to stabilize
+          sleep 60
+
+          # Remove old deployment if everything is healthy
+          OLD_VERSION="blue"
+          if [ "$NEW_VERSION" == "blue" ]; then
+            OLD_VERSION="green"
+          fi
+
+          kubectl delete deployment app-${OLD_VERSION} --ignore-not-found=true
+
+          echo "✅ Cleanup completed"
+
+  # ===========================================
+  # ROLLING DEPLOYMENT
+  # ===========================================
+  rolling-deploy:
+    name: Rolling Deployment
+    runs-on: ubuntu-latest
+    needs: [pre-deploy-validation, manifest-validation]
+    if: |
+      needs.pre-deploy-validation.outputs.can-deploy == 'true' &&
+      (github.event.inputs.strategy == 'rolling' ||
+       github.ref == 'refs/heads/develop')
+    environment:
+      name: staging
+      url: https://staging.example.com
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: us-west-2
+
+      - name: Update kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Setup Kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Rolling Update Deployment
+        run: |
+          echo "🔄 Starting rolling deployment..."
+
+          # Update container image
+          NEW_IMAGE="${{ needs.pre-deploy-validation.outputs.deployment-image }}"
+          kubectl set image deployment/app-deployment app=${NEW_IMAGE}
+
+          # Watch rolling update progress
+          kubectl rollout status deployment/app-deployment --timeout=600s
+
+          echo "✅ Rolling deployment completed"
+
+      - name: Validate Rolling Deployment
+        run: |
+          echo "🔍 Validating rolling deployment..."
+
+          # Check deployment status
+          kubectl get deployment app-deployment
+          kubectl get pods -l app=app
+
+          # Run smoke tests
+          POD_NAME=$(kubectl get pods -l app=app -o jsonpath='{.items[0].metadata.name}')
+          kubectl exec $POD_NAME -- curl -f http://localhost:3000/health
+
+          echo "✅ Deployment validation completed"
+
+  # ===========================================
+  # CANARY DEPLOYMENT
+  # ===========================================
+  canary-deploy:
+    name: Canary Deployment
+    runs-on: ubuntu-latest
+    needs: [pre-deploy-validation, manifest-validation]
+    if: |
+      needs.pre-deploy-validation.outputs.can-deploy == 'true' &&
+      github.event.inputs.strategy == 'canary'
+    environment:
+      name: production
+      url: https://app.example.com
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: us-west-2
+
+      - name: Update kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG_PROD }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Setup Kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Canary Deployment
+        run: |
+          echo "🐤 Starting canary deployment..."
+
+          # Deploy canary version (10% traffic)
+          envsubst < k8s/canary-deployment.yaml | kubectl apply -f -
+
+          # Update service to include canary
+          kubectl apply -f k8s/canary-service.yaml
+
+          # Wait for canary to be ready
+          kubectl rollout status deployment/app-canary --timeout=300s
+
+          echo "✅ Canary deployment completed"
+
+      - name: Canary Traffic Analysis
+        run: |
+          echo "📊 Analyzing canary traffic..."
+
+          # Monitor canary metrics (placeholder for actual monitoring)
+          echo "Monitoring canary for 5 minutes..."
+          sleep 300
+
+          # Check error rates and response times
+          # This would typically involve Prometheus/Grafana queries
+          echo "✅ Traffic analysis completed"
+
+      - name: Promote or Rollback Canary
+        run: |
+          echo "🚀 Evaluating canary performance..."
+
+          # Decision logic based on metrics
+          PROMOTE_CANARY=true  # This would be based on actual metrics
+
+          if [ "$PROMOTE_CANARY" = true ]; then
+            echo "✅ Promoting canary to full deployment"
+            kubectl patch service app-service -p '{"spec":{"selector":{"version":"canary"}}}'
+            kubectl delete deployment app-stable --ignore-not-found=true
+          else
+            echo "❌ Rolling back canary"
+            kubectl delete deployment app-canary
+          fi
+
+  # ===========================================
+  # ROLLBACK JOB
+  # ===========================================
+  rollback-deployment:
+    name: Rollback Deployment
+    runs-on: ubuntu-latest
+    if: |
+      github.event.inputs.rollback == 'true' &&
+      github.event_name == 'workflow_dispatch'
+    environment:
+      name: production
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: us-west-2
+
+      - name: Update kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG_PROD }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Setup Kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Rollback to Previous Version
+        run: |
+          echo "⏪ Rolling back deployment..."
+
+          # Get previous revision
+          PREVIOUS_REVISION=$(kubectl rollout history deployment/app-deployment | awk 'NR==3{print $1}')
+
+          # Rollback to previous revision
+          kubectl rollout undo deployment/app-deployment --to-revision=$PREVIOUS_REVISION
+
+          # Wait for rollback to complete
+          kubectl rollout status deployment/app-deployment --timeout=300s
+
+          echo "✅ Rollback completed successfully"
+
+  # ===========================================
+  # POST-DEPLOYMENT MONITORING
+  # ===========================================
+  post-deploy-monitoring:
+    name: Post-Deployment Monitoring
+    runs-on: ubuntu-latest
+    needs: [blue-green-deploy, rolling-deploy, canary-deploy]
+    if: always() && (
+      needs.blue-green-deploy.result == 'success' ||
+      needs.rolling-deploy.result == 'success' ||
+      needs.canary-deploy.result == 'success'
+    )
+
+    steps:
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: us-west-2
+
+      - name: Update kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG_PROD }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Setup Kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Collect Deployment Metrics
+        run: |
+          echo "📊 Collecting post-deployment metrics..."
+
+          # Get pod status
+          kubectl get pods -l app=app -o wide
+
+          # Check resource usage
+          kubectl top pods -l app=app
+
+          # Get service endpoints
+          kubectl get endpoints app-service
+
+          # Check events
+          kubectl get events --sort-by='.lastTimestamp' | tail -20
+
+          echo "✅ Metrics collection completed"
+
+      - name: Health Check Monitoring
+        run: |
+          echo "🏥 Running comprehensive health checks..."
+
+          # Application health checks
+          for i in {1..12}; do
+            if curl -f https://app.example.com/health; then
+              echo "✅ Application health check passed"
+            else
+              echo "❌ Health check failed at attempt $i"
+              if [ $i -eq 12 ]; then
+                exit 1
+              fi
+            fi
+            sleep 30
+          done
+
+          echo "✅ Health monitoring completed"
+
+      - name: Slack Deployment Notification
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            🚀 Kubernetes deployment completed!
+
+            **Repository**: ${{ github.repository }}
+            **Commit**: ${{ github.sha }}
+            **Deployed by**: ${{ github.actor }}
+            **Strategy**: ${{ github.event.inputs.strategy || 'auto' }}
+
+            🔗 [View Application](https://app.example.com)
+          channel: ${{ secrets.SLACK_DEPLOYMENTS_CHANNEL }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

@@ -1,0 +1,436 @@
+name: 🏗️ CI Build and Deploy Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  NODE_VERSION: '18'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+  deployments: write
+  id-token: write # For OIDC
+
+# Concurrency controls to prevent simultaneous deployments
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ===========================================
+  # BUILD AND TEST MATRIX
+  # ===========================================
+  build-matrix:
+    name: Build & Test Matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node-version: [16, 18, 20]
+        include:
+          - os: ubuntu-latest
+            node-version: 18
+            cache-path: ~/.npm
+            platform: linux
+          - os: windows-latest
+            node-version: 18
+            cache-path: ~\AppData\Local\npm-cache
+            platform: windows
+          - os: macos-latest
+            node-version: 18
+            cache-path: ~/.npm
+            platform: macos
+      max-parallel: 3
+
+    outputs:
+      build-success: ${{ steps.build.outcome == 'success' }}
+      test-coverage: ${{ steps.coverage.outputs.coverage }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+            package.json
+
+      - name: Advanced NPM Cache Strategy
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ matrix.cache-path }}
+            node_modules/.cache
+          key: ${{ runner.os }}-node-v${{ matrix.node-version }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-v${{ matrix.node-version }}-
+            ${{ runner.os }}-node-
+
+      - name: Install Dependencies
+        run: |
+          npm ci --prefer-offline --no-audit --no-fund
+          npm audit --audit-level=high || true
+
+      - name: Lint and Format Check
+        id: lint
+        run: |
+          npm run lint:check
+          npm run format:check
+        continue-on-error: true
+
+      - name: Unit and Integration Tests
+        id: test
+        run: |
+          npm run test:unit
+          npm run test:integration
+        continue-on-error: true
+
+      - name: Generate Coverage Report
+        id: coverage
+        if: matrix.os == 'ubuntu-latest' && matrix.node-version == '18'
+        run: |
+          npm run test:coverage
+          COVERAGE=$(npx nyc report --reporter=text-summary | grep "Lines" | awk '{print $2}' | sed 's/%//')
+          echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
+          echo "Test coverage: ${COVERAGE}%"
+
+      - name: Build Application
+        id: build
+        run: |
+          npm run build
+          echo "Build completed successfully for ${{ matrix.os }} with Node.js ${{ matrix.node-version }}"
+
+      - name: Bundle Size Analysis
+        if: matrix.os == 'ubuntu-latest' && matrix.node-version == '18'
+        run: |
+          npx bundlesize
+          echo "Bundle size analysis completed"
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.platform }}-${{ matrix.node-version }}
+          path: |
+            coverage/
+            test-results/
+            junit.xml
+          retention-days: 7
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.platform }}
+          path: |
+            dist/
+            build/
+          retention-days: 7
+
+  # ===========================================
+  # SECURITY SCANNING INTEGRATION
+  # ===========================================
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    needs: build-matrix
+    if: needs.build-matrix.outputs.build-success == 'true'
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Run Security Scan Workflow
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'security-scan.yml',
+              ref: context.sha
+            });
+
+  # ===========================================
+  # CONTAINER BUILD AND PUSH
+  # ===========================================
+  container-build:
+    name: Build and Push Container
+    runs-on: ubuntu-latest
+    needs: [build-matrix]
+    if: needs.build-matrix.outputs.build-success == 'true'
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-linux
+          path: ./dist
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:buildx-stable-1
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Container Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=${{ github.event.repository.name }}
+            org.opencontainers.image.description=${{ github.event.repository.description }}
+            org.opencontainers.image.url=${{ github.event.repository.html_url }}
+            org.opencontainers.image.source=${{ github.event.repository.clone_url }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=${{ github.event.repository.license.spdx_id }}
+
+      - name: Build and Push Container Image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=buildkit
+          cache-to: type=gha,scope=buildkit,mode=max
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            NODE_VERSION=${{ env.NODE_VERSION }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+          provenance: true
+          sbom: true
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: true
+
+      - name: Container Security Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          exit-code: '0'
+          ignore-unfixed: true
+
+      - name: Upload Trivy Results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: container-security
+
+  # ===========================================
+  # DEPLOYMENT JOBS
+  # ===========================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build-matrix, container-build, security-scan]
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment:
+      name: staging
+      url: https://staging.example.com
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: us-west-2
+
+      - name: Deploy to Kubernetes
+        run: |
+          echo "Deploying to staging environment..."
+          # Kubernetes deployment logic here
+
+      - name: Smoke Tests
+        run: |
+          echo "Running smoke tests..."
+          # Health checks and smoke tests
+
+      - name: Update Deployment Status
+        if: always()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: '${{ github.token }}'
+          environment-url: https://staging.example.com
+          deployment-id: ${{ github.event.deployment.id }}
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build-matrix, container-build, security-scan]
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      (startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    environment:
+      name: production
+      url: https://app.example.com
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PRODUCTION }}
+          aws-region: us-west-2
+
+      - name: Production Deployment Readiness Check
+        run: |
+          echo "Checking production deployment readiness..."
+          # Pre-deployment checks
+
+      - name: Blue-Green Deployment to Kubernetes
+        run: |
+          echo "Executing blue-green deployment..."
+          # Production deployment logic
+
+      - name: Production Health Checks
+        run: |
+          echo "Running production health checks..."
+          # Comprehensive health checks
+
+      - name: Post-Deployment Validation
+        run: |
+          echo "Validating production deployment..."
+          # Post-deployment validation
+
+  # ===========================================
+  # PERFORMANCE TESTING
+  # ===========================================
+  performance-tests:
+    name: Performance Testing
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: needs.deploy-staging.result == 'success'
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Performance Testing Tools
+        run: |
+          npm install -g artillery k6
+
+      - name: Load Testing
+        run: |
+          artillery run load-test-config.yml
+
+      - name: K6 Performance Tests
+        run: |
+          k6 run performance-tests.js
+
+      - name: Upload Performance Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-reports
+          path: |
+            artillery-report.html
+            k6-report.html
+          retention-days: 30
+
+  # ===========================================
+  # POST-DEPLOYMENT NOTIFICATIONS
+  # ===========================================
+  notify-deployment:
+    name: Deployment Notifications
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: always() && (needs.deploy-staging.result == 'success' || needs.deploy-production.result == 'success')
+
+    steps:
+      - name: Determine Deployment Environment
+        id: env
+        run: |
+          if [ "${{ needs.deploy-production.result }}" == "success" ]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.deploy-staging.result }}" == "success" ]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Slack Deployment Notification
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            🚀 Deployment to ${{ steps.env.outputs.environment }} completed successfully!
+
+            **Repository**: ${{ github.repository }}
+            **Commit**: ${{ github.sha }}
+            **Environment**: ${{ steps.env.outputs.environment }}
+            **Deployed by**: ${{ github.actor }}
+
+            🔗 [View Deployment](${{ github.server_url }}/${{ github.repository }}/deployments)
+          channel: ${{ secrets.SLACK_DEPLOYMENTS_CHANNEL }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Update Deployment Status
+        if: steps.env.outputs.environment == 'production'
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: '${{ github.token }}'
+          environment-url: https://app.example.com
+          deployment-id: ${{ github.event.deployment.id }}

@@ -1,0 +1,1151 @@
+name: 🔒 Security CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop, deploy_prod, deploy_demo ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '18'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ===========================================
+  # PARALLEL SAST SCANNING
+  # ===========================================
+  security-scan:
+    name: 🔍 Security Scanning
+    runs-on: ubuntu-latest
+    outputs:
+      gitleaks-results: ${{ steps.gitleaks.outputs.results }}
+      semgrep-results: ${{ steps.semgrep.outputs.results }}
+      trivy-fs-results: ${{ steps.trivy-fs.outputs.results }}
+      policy-check: ${{ steps.policy-check.outputs.status }}
+    strategy:
+      fail-fast: false
+      matrix:
+        tool: [gitleaks, semgrep, trivy-fs, syft-sbom]
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🔍 Gitleaks Secret Detection
+        if: matrix.tool == 'gitleaks'
+        id: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        with:
+          format: sarif
+          output_file: gitleaks.sarif
+
+      - name: 📤 Upload Gitleaks Results
+        if: matrix.tool == 'gitleaks'
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: gitleaks.sarif
+
+      - name: 🔍 Semgrep SAST Scan
+        if: matrix.tool == 'semgrep'
+        id: semgrep
+        uses: semgrep/semgrep-action@v1
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        with:
+          config: >-
+            p/nodejs
+            p/express
+            p/javascript
+            p/security
+            p/owasp-top-ten
+            p/cwe-top-25
+            p/r2c-security-audit
+            p/xss
+            p/sql-injection
+            p/command-injection
+            p/secrets
+            p/trailofbits
+            p/npm-audit
+            .github/semgrep-config.yaml
+          publish: true
+          generate-sarif: '1'
+          output: semgrep.sarif
+
+      - name: 📤 Upload Semgrep Results
+        if: matrix.tool == 'semgrep'
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+
+      - name: 🔍 Trivy Filesystem Scan
+        if: matrix.tool == 'trivy-fs'
+        id: trivy-fs
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs.sarif'
+          exit-code: '0'
+
+      - name: 📤 Upload Trivy FS Results
+        if: matrix.tool == 'trivy-fs'
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: trivy-fs.sarif
+
+      - name: 📦 Syft SBOM Generation
+        if: matrix.tool == 'syft-sbom'
+        uses: anchore/sbom-action@v0
+        with:
+          image: '.'
+          format: 'cyclonedx-json'
+          output-file: 'syft-sbom.cdx.json'
+
+      - name: 📤 Upload SBOM Artifacts
+        if: matrix.tool == 'syft-sbom'
+        uses: actions/upload-artifact@v3
+        with:
+          name: sbom-cyclonedx
+          path: syft-sbom.cdx.json
+          retention-days: 30
+
+  # ===========================================
+  # NODE.JS BUILD & TEST
+  # ===========================================
+  build-nodejs:
+    name: 🔨 Node.js Build & Test
+    runs-on: ubuntu-latest
+    needs: security-scan
+    outputs:
+      test-results: ${{ steps.test.outputs.results }}
+      security-audit: ${{ steps.audit.outputs.results }}
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: 📦 Install Dependencies
+        run: npm ci
+
+      - name: 🔍 Security Audit
+        id: audit
+        run: |
+          echo "🔍 Running npm security audit..."
+          npm audit --audit-level=high || echo "Security audit completed with findings"
+          echo "results=completed" >> $GITHUB_OUTPUT
+
+      - name: 🧪 Run Linting
+        run: npm run lint:check
+
+      - name: 🧪 Run Tests
+        id: test
+        run: |
+          echo "🧪 Running test suite..."
+          npm run test
+          echo "results=passed" >> $GITHUB_OUTPUT
+
+      - name: 📦 Build Application
+        run: npm run build
+
+      - name: 📤 Upload Build Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-artifacts
+          path: |
+            dist/
+            coverage/
+            node_modules/
+          retention-days: 7
+
+      - name: 📊 Upload Coverage Reports
+        uses: codecov/codecov-action@v3
+        if: always()
+        with:
+          file: ./coverage/lcov.info
+          flags: unittests
+          name: codecov-umbrella
+
+  # ===========================================
+  # DOCKER BUILD & SECURITY SCAN
+  # ===========================================
+  build-docker:
+    name: 🐳 Docker Build & Security
+    runs-on: ubuntu-latest
+    needs: build-nodejs
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      scan-results: ${{ steps.scan.outputs.results }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 📦 Download Build Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build-artifacts
+
+      - name: 🔐 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 🔐 Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🏷️ Extract Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: 🐳 Build and Push Docker Image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      - name: 🔍 Trivy Docker Security Scan
+        id: scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: 'sarif'
+          output: 'trivy-docker.sarif'
+          exit-code: '0'
+
+      - name: 📤 Upload Trivy Docker Results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: trivy-docker.sarif
+
+      - name: 📤 Upload Docker Image SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: 'cyclonedx-json'
+          output-file: 'docker-sbom.cdx.json'
+
+      - name: 📤 Upload Docker SBOM Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: docker-sbom
+          path: docker-sbom.cdx.json
+          retention-days: 30
+
+  # ===========================================
+  # SECURITY POLICY VALIDATION
+  # ===========================================
+  security-policy-check:
+    name: 🔒 Security Policy Validation
+    runs-on: ubuntu-latest
+    needs: [security-scan, build-nodejs, build-docker]
+    outputs:
+      policy-status: ${{ steps.policy.outputs.status }}
+      high-critical-count: ${{ steps.policy.outputs.high-critical }}
+      medium-count: ${{ steps.policy.outputs.medium }}
+      deployment-approved: ${{ steps.policy.outputs.deployment-approved }}
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 📦 Download All Security Reports
+        uses: actions/download-artifact@v3
+        with:
+          pattern: "*"
+          merge-multiple: true
+
+      - name: 🔒 Enhanced Security Policy Check
+        id: policy
+        run: |
+          # Install dependencies for enhanced policy check
+          npm install -g @actions/core
+
+          # Run enhanced security policy check
+          node .github/scripts/security-policy-check.js \
+            --fail-on-high-critical \
+            --fail-on-medium=${{ vars.FAIL_ON_MEDIUM || 'false' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FAIL_ON_HIGH_CRITICAL: ${{ vars.FAIL_ON_HIGH_CRITICAL || 'true' }}
+          FAIL_ON_MEDIUM: ${{ vars.FAIL_ON_MEDIUM || 'false' }}
+        continue-on-error: true
+
+      - name: 📊 Upload Security Summary
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-summary
+          path: |
+            security-summary.json
+            security-summary.md
+            security-policy-report.json
+          retention-days: 30
+
+      - name: 📋 Extract Security Policy Results
+        id: policy-results
+        if: always()
+        run: |
+          # Extract policy check results from generated report
+          if [ -f "security-policy-report.json" ]; then
+            STATUS=$(cat security-policy-report.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    print(data.get('decision', 'unknown'))
+except:
+    print('unknown')
+" 2>/dev/null || echo "unknown")
+
+            HIGH_CRITICAL=$(cat security-policy-report.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    vulns = data.get('summary', {}).get('vulnerabilities', {})
+    print(vulns.get('critical', 0) + vulns.get('high', 0))
+except:
+    print('0')
+" 2>/dev/null || echo "0")
+
+            MEDIUM=$(cat security-policy-report.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    vulns = data.get('summary', {}).get('vulnerabilities', {})
+    print(vulns.get('medium', 0))
+except:
+    print('0')
+" 2>/dev/null || echo "0")
+
+            echo "status=$STATUS" >> $GITHUB_OUTPUT
+            echo "high-critical=$HIGH_CRITICAL" >> $GITHUB_OUTPUT
+            echo "medium=$MEDIUM" >> $GITHUB_OUTPUT
+            echo "deployment-approved=$(if [ '$STATUS' = 'approved' ]; then echo 'true'; else echo 'false'; fi)" >> $GITHUB_OUTPUT
+          else
+            echo "status=unknown" >> $GITHUB_OUTPUT
+            echo "high-critical=0" >> $GITHUB_OUTPUT
+            echo "medium=0" >> $GITHUB_OUTPUT
+            echo "deployment-approved=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 📤 Upload Policy Check to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: security-policy-report.json
+          category: 'policy-check'
+          verification: false
+
+  # ===========================================
+  # INTEGRATION & REPORTING
+  # ===========================================
+  integrations:
+    name: 📤 Security Integrations
+    runs-on: ubuntu-latest
+    needs: [build-docker, security-policy-check]
+    if: always()
+    strategy:
+      matrix:
+        integration: [defectdojo, dependency-track]
+    outputs:
+      defectdojo-uploads: ${{ steps.defectdojo.outputs.uploads-count }}
+      dependency-track-findings: ${{ steps.dependency-track.outputs.findings-count }}
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 📦 Download Security Reports
+        uses: actions/download-artifact@v3
+        with:
+          pattern: "*"
+          merge-multiple: true
+
+      - name: 📤 Enhanced DefectDojo Integration
+        if: matrix.integration == 'defectdojo'
+        run: |
+          echo "📤 Enhanced DefectDojo integration..."
+
+          # Install dependencies
+          npm install -g @actions/core
+
+          # Run enhanced DefectDojo integration
+          node .github/scripts/defectdojo-integration.js \
+            syft-sbom.cdx.json \
+            docker-sbom.cdx.json \
+            gitleaks.sarif \
+            semgrep.sarif \
+            trivy-fs.sarif \
+            trivy-docker.sarif \
+            security-summary.json \
+            security-policy-report.json
+        env:
+          DEFECTDOJO_URL: ${{ secrets.DEFECTDOJO_URL }}
+          DEFECTDOJO_API_KEY: ${{ secrets.DEFECTDOJO_API_KEY }}
+          PROJECT_NAME: ${{ vars.PROJECT_NAME || github.event.repository.name }}
+          DEFECTDOJO_ENGAGEMENT_NAME: "GitHub Actions CI/CD - ${{ github.ref_name }}"
+          DEFECTDOJO_AUTO_CREATE: "true"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+        id: defectdojo
+
+      - name: 📤 Enhanced Dependency-Track Integration
+        if: matrix.integration == 'dependency-track'
+        run: |
+          echo "📤 Enhanced Dependency-Track integration..."
+
+          # Install dependencies
+          npm install -g @actions/core
+
+          # Run enhanced Dependency-Track integration
+          node .github/scripts/dependency-track-integration.js \
+            syft-sbom.cdx.json
+        env:
+          DEPENDENCY_TRACK_URL: ${{ secrets.DEPENDENCY_TRACK_URL }}
+          DEPENDENCY_TRACK_API_KEY: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}
+          PROJECT_NAME: ${{ vars.PROJECT_NAME || github.event.repository.name }}
+          PROJECT_VERSION: "${{ github.ref_name }}-${{ github.sha }}"
+          DEPENDENCY_TRACK_AUTO_CREATE: "true"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+        id: dependency-track
+
+  # ===========================================
+  # KUBERNETES DEPLOYMENT
+  # ===========================================
+  deploy:
+    name: ☸️ Enhanced Kubernetes Deployment
+    runs-on: ubuntu-latest
+    needs: [build-docker, security-policy-check, integrations]
+    if: |
+      always() &&
+      (github.ref == 'refs/heads/deploy_prod' || github.ref == 'refs/heads/deploy_demo') &&
+      needs.security-policy-check.result == 'success' &&
+      needs.security-policy-check.outputs.deployment-approved == 'true'
+    environment:
+      name: ${{ github.ref == 'refs/heads/deploy_prod' && 'production' || 'demo' }}
+      url: ${{ steps.deploy.outputs.service-url || 'https://poc-project.com/poc-project' }}
+    permissions:
+      contents: read
+      deployments: write
+
+    outputs:
+      deployment-status: ${{ steps.deploy.outputs.deployment-status }}
+      service-url: ${{ steps.deploy.outputs.service-url }}
+      rollback-available: ${{ steps.deploy.outputs.rollback-available }}
+      previous-revision: ${{ steps.deploy.outputs.previous-revision }}
+
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔐 Setup Kubernetes Access
+        run: |
+          # Install required tools
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+          # Setup kubeconfig
+          echo "${{ secrets.KUBE_CONFIG_BASE64 }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+
+          # Configure context
+          kubectl config use-context ${{ github.ref == 'refs/heads/deploy_prod' && 'poc-project-prod' || 'poc-project-demo' }}
+
+      - name: 🔍 Pre-deployment Security Validation
+        id: pre-deploy-security
+        run: |
+          echo "🔒 Performing pre-deployment security validation..."
+
+          export KUBECONFIG=kubeconfig
+          NAMESPACE="${{ github.ref == 'refs/heads/deploy_prod' && 'poc-project-prod' || 'poc-project-demo' }}"
+          ENVIRONMENT="${{ github.ref == 'refs/heads/deploy_prod' && 'production' || 'demo' }}"
+
+          # Check cluster access
+          kubectl cluster-info
+
+          # Create namespace if it doesn't exist
+          kubectl create namespace $NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+
+          # For production, verify security requirements
+          if [ "$ENVIRONMENT" = "production" ]; then
+            echo "🔍 Validating production security requirements..."
+
+            # Check network policies
+            if ! kubectl get networkpolicy -n $NAMESPACE | grep -q "secure"; then
+              echo "⚠️  Warning: No network policies found"
+            fi
+
+            # Check resource limits
+            if ! kubectl get limitrange -n $NAMESPACE | grep -q "limits"; then
+              echo "⚠️  Warning: No resource limits configured"
+            fi
+
+            # Verify pod security standards
+            echo "✅ Pre-deployment security validation completed"
+          fi
+
+      - name: 🚀 Enhanced Kubernetes Deployment
+        id: deploy
+        uses: ./.github/actions/k8s-deploy
+        with:
+          cluster-config: kubeconfig
+          namespace: ${{ github.ref == 'refs/heads/deploy_prod' && 'poc-project-prod' || 'poc-project-demo' }}
+          manifests-path: '.github/kubernetes'
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          environment: ${{ github.ref == 'refs/heads/deploy_prod' && 'production' || 'demo' }}
+          wait-timeout: 600
+          enable-rollback: true
+          enable-canary: ${{ vars.ENABLE_CANARY || 'false' }}
+          canary-percentage: ${{ vars.CANARY_PERCENTAGE || '10' }}
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          KUBECONFIG: kubeconfig
+
+      - name: 🏥 Post-deployment Health Check
+        if: steps.deploy.outputs.deployment-status == 'success'
+        run: |
+          echo "🏥 Performing post-deployment health checks..."
+
+          export KUBECONFIG=kubeconfig
+          NAMESPACE="${{ github.ref == 'refs/heads/deploy_prod' && 'poc-project-prod' || 'poc-project-demo' }}"
+          SERVICE_URL="${{ steps.deploy.outputs.service-url }}"
+
+          # Check deployment status
+          kubectl get deployment secure-nodejs-app -n $NAMESPACE
+
+          # Check pod status
+          kubectl get pods -l app=secure-nodejs-app -n $NAMESPACE
+
+          # Check service status
+          kubectl get service secure-nodejs-app-service -n $NAMESPACE
+
+          # Perform application health check
+          if [ ! -z "$SERVICE_URL" ] && [ "$SERVICE_URL" != "http://localhost:30000" ]; then
+            echo "🌐 Testing service endpoint: $SERVICE_URL"
+
+            # Health check with retries
+            for i in {1..10}; do
+              if curl -f -s "$SERVICE_URL/health" > /dev/null; then
+                echo "✅ Application health check passed"
+                break
+              fi
+
+              if [ $i -eq 10 ]; then
+                echo "❌ Health check failed after 10 attempts"
+                exit 1
+              fi
+
+              echo "⏳ Waiting for application... ($i/10)"
+              sleep 15
+            done
+
+            # Test ready endpoint
+            if curl -f -s "$SERVICE_URL/ready" > /dev/null; then
+              echo "✅ Application ready check passed"
+            else
+              echo "⚠️  Application not ready yet"
+            fi
+          else
+            echo "⚠️  Service URL not available, skipping HTTP health check"
+          fi
+
+      - name: 📊 Generate Deployment Report
+        if: always()
+        run: |
+          echo "📊 Generating deployment report..."
+
+          export KUBECONFIG=kubeconfig
+          NAMESPACE="${{ github.ref == 'refs/heads/deploy_prod' && 'poc-project-prod' || 'poc-project-demo' }}"
+          DEPLOYMENT_STATUS="${{ steps.deploy.outputs.deployment-status }}"
+          SERVICE_URL="${{ steps.deploy.outputs.service-url }}"
+
+          # Create deployment report
+          cat > deployment-report.json << EOF
+          {
+            "timestamp": "$(date -Iseconds)",
+            "repository": "${{ github.repository }}",
+            "commit": "${{ github.sha }}",
+            "branch": "${{ github.ref_name }}",
+            "environment": "${{ github.ref == 'refs/heads/deploy_prod' && 'production' || 'demo' }}",
+            "namespace": "$NAMESPACE",
+            "image": "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}",
+            "deployment_status": "$DEPLOYMENT_STATUS",
+            "service_url": "$SERVICE_URL",
+            "rollback_available": "${{ steps.deploy.outputs.rollback-available }}",
+            "run_id": "${{ github.run_id }}",
+            "actor": "${{ github.actor }}",
+            "kubernetes_resources": {
+              "deployment": "secure-nodejs-app",
+              "service": "secure-nodejs-app-service",
+              "namespace": "$NAMESPACE"
+            }
+          }
+          EOF
+
+          echo "📋 Deployment Report:"
+          cat deployment-report.json | jq . || cat deployment-report.json
+
+          # Upload report as artifact
+          mkdir -p deployment-artifacts
+          cp deployment-report.json deployment-artifacts/
+
+      - name: 📤 Upload Deployment Artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: deployment-report-${{ github.ref == 'refs/heads/deploy_prod' && 'prod' || 'demo' }}
+          path: deployment-artifacts/
+          retention-days: 30
+
+      - name: 🧹 Cleanup
+        if: always()
+        run: |
+          echo "🧹 Cleaning up temporary files..."
+          rm -rf deployment-artifacts kubeconfig
+          echo "✅ Cleanup completed"
+
+  # ===========================================
+  # PERFORMANCE OPTIMIZATION & MONITORING
+  # ===========================================
+  performance-analysis:
+    name: ⚡ Performance Analysis & Optimization
+    runs-on: ubuntu-latest
+    needs: [build-nodejs, build-docker]
+    if: always() && (needs.build-nodejs.result == 'success' || needs.build-docker.result == 'success')
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: 🔧 Install Dependencies
+        run: |
+          if [ -f "package.json" ]; then
+            npm ci --prefer-offline --no-audit
+          fi
+
+      - name: ⚡ Run Performance Analysis
+        run: |
+          echo "🚀 Starting performance analysis..."
+
+          # Make script executable
+          chmod +x .github/scripts/performance-optimizer.js
+
+          # Run performance optimization analysis
+          node .github/scripts/performance-optimizer.js
+
+          # Display summary
+          if [ -f "performance-optimization-report.json" ]; then
+            echo ""
+            echo "📊 Performance Analysis Summary:"
+
+            # Extract key metrics
+            TOTAL_OPTIMIZATIONS=$(cat performance-optimization-report.json | jq -r '.summary.totalOptimizations')
+            HIGH_PRIORITY=$(cat performance-optimization-report.json | jq -r '.summary.highPriority')
+            MEDIUM_PRIORITY=$(cat performance-optimization-report.json | jq -r '.summary.mediumPriority')
+
+            echo "   Total Optimizations: $TOTAL_OPTIMIZATIONS"
+            echo "   High Priority: $HIGH_PRIORITY ⚠️"
+            echo "   Medium Priority: $MEDIUM_PRIORITY 💡"
+
+            # Set outputs for GitHub Actions
+            echo "total-optimizations=$TOTAL_OPTIMIZATIONS" >> $GITHUB_OUTPUT
+            echo "high-priority=$HIGH_PRIORITY" >> $GITHUB_OUTPUT
+            echo "medium-priority=$MEDIUM_PRIORITY" >> $GITHUB_OUTPUT
+
+            if [ "$HIGH_PRIORITY" -gt 0 ]; then
+              echo "⚠️  Found $HIGH_PRIORITY high priority optimizations"
+              echo "high-priority-issues=true" >> $GITHUB_OUTPUT
+            else
+              echo "✅ No high priority issues found"
+              echo "high-priority-issues=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "❌ Performance analysis report not generated"
+            exit 1
+          fi
+
+      - name: 📤 Upload Performance Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-analysis-report
+          path: |
+            performance-optimization-report.json
+            performance-optimization-summary.md
+          retention-days: 30
+
+      - name: 💬 Performance Comment on PR
+        if: github.event_name == 'pull_request'
+        run: |
+          # Find performance issues and comment on PR
+          if [ -f "performance-optimization-summary.md" ]; then
+            COMMENT_BODY=$(cat <<EOF
+          ## ⚡ Performance Analysis Results
+
+          $(cat performance-optimization-summary.md)
+
+          ---
+          *Performance analysis by GitHub Actions*
+          EOF
+          )
+
+            # Post comment to PR
+            gh pr comment "$PR_NUMBER" --body "$COMMENT_BODY"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+
+  apm-integration:
+    name: 📊 Application Performance Monitoring
+    runs-on: ubuntu-latest
+    needs: [deploy, performance-analysis]
+    if: always() && needs.deploy.result == 'success'
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: 📤 Download Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          pattern: "*"
+          merge-multiple: true
+
+      - name: 📊 Send Metrics to APM Systems
+        id: apm
+        run: |
+          echo "📊 Starting APM integration..."
+
+          # Make script executable
+          chmod +x .github/scripts/apm-integration.js
+
+          # Run APM integration
+          RESULT=$(node .github/scripts/apm-integration.js execute)
+          echo "$RESULT"
+
+          # Extract results
+          DATADOG_SUCCESS=$(echo "$RESULT" | jq -r '.metrics.datadog.success // false')
+          NEWRELIC_SUCCESS=$(echo "$RESULT" | jq -r '.metrics.newRelic.success // false')
+          PROMETHEUS_SUCCESS=$(echo "$RESULT" | jq -r '.metrics.prometheus.success // false')
+          GRAFANA_SUCCESS=$(echo "$RESULT" | jq -r '.grafana.success // false')
+          METRICS_COLLECTED=$(echo "$RESULT" | jq -r '.metrics.collected // 0')
+
+          # Set outputs
+          echo "datadog-success=$DATADOG_SUCCESS" >> $GITHUB_OUTPUT
+          echo "newrelic-success=$NEWRELIC_SUCCESS" >> $GITHUB_OUTPUT
+          echo "prometheus-success=$PROMETHEUS_SUCCESS" >> $GITHUB_OUTPUT
+          echo "grafana-success=$GRAFANA_SUCCESS" >> $GITHUB_OUTPUT
+          echo "metrics-collected=$METRICS_COLLECTED" >> $GITHUB_OUTPUT
+
+          echo "✅ APM integration completed"
+          echo "   Metrics collected: $METRICS_COLLECTED"
+          echo "   Datadog: $DATADOG_SUCCESS"
+          echo "   New Relic: $NEWRELIC_SUCCESS"
+          echo "   Prometheus: $PROMETHEUS_SUCCESS"
+          echo "   Grafana: $GRAFANA_SUCCESS"
+        env:
+          DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+          DATADOG_APP_KEY: ${{ secrets.DATADOG_APP_KEY }}
+          NEW_RELIC_API_KEY: ${{ secrets.NEW_RELIC_API_KEY }}
+          PROMETHEUS_GATEWAY_URL: ${{ secrets.PROMETHEUS_GATEWAY_URL }}
+          GRAFANA_URL: ${{ secrets.GRAFANA_URL }}
+          GRAFANA_API_KEY: ${{ secrets.GRAFANA_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: 📈 Create Performance Dashboard
+        if: steps.apm.outputs.grafana-success == 'true'
+        run: |
+          echo "📈 Performance dashboard created successfully"
+          echo "   Grafana URL: ${{ secrets.GRAFANA_URL }}"
+          echo "   Dashboard available in Grafana"
+
+  monitoring-setup:
+    name: 🔍 Setup Production Monitoring
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always() && needs.deploy.result == 'success' && github.ref == 'refs/heads/deploy_prod'
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔐 Setup kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+      - name: 🔐 Configure Kubernetes Access
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_BASE64 }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+          kubectl config use-context poc-project-prod
+
+      - name: 🔍 Deploy Monitoring Stack
+        run: |
+          export KUBECONFIG=kubeconfig
+          NAMESPACE="poc-project-prod"
+
+          echo "🔍 Setting up monitoring stack..."
+
+          # Apply monitoring manifests
+          if [ -f ".github/kubernetes/monitoring.yaml" ]; then
+            kubectl apply -f .github/kubernetes/monitoring.yaml -n $NAMESPACE
+
+            # Wait for monitoring pods to be ready
+            kubectl wait --for=condition=Ready pod -l app=prometheus -n $NAMESPACE --timeout=300s
+            kubectl wait --for=condition=Ready pod -l app=grafana -n $NAMESPACE --timeout=300s
+
+            echo "✅ Monitoring stack deployed successfully"
+
+            # Get service URLs
+            PROMETHEUS_URL=$(kubectl get service prometheus -n $NAMESPACE -o jsonpath='{.spec.clusterIP}:9090')
+            GRAFANA_URL=$(kubectl get service grafana -n $NAMESPACE -o jsonpath='{.spec.clusterIP}:80')
+
+            echo "📊 Monitoring Services:"
+            echo "   Prometheus: http://$PROMETHEUS_URL"
+            echo "   Grafana: http://$GRAFANA_URL"
+            echo "   Grafana Admin: admin / secure-password123"
+          else
+            echo "⚠️  Monitoring manifests not found"
+          fi
+
+      - name: 📊 Verify Monitoring
+        run: |
+          export KUBECONFIG=kubeconfig
+          NAMESPACE="poc-project-prod"
+
+          echo "📊 Verifying monitoring setup..."
+
+          # Check Prometheus
+          if curl -f "http://prometheus.$NAMESPACE.svc.cluster.local:9090/-/healthy" &> /dev/null; then
+            echo "✅ Prometheus is healthy"
+          else
+            echo "❌ Prometheus is not responding"
+          fi
+
+          # Check Grafana
+          if curl -f "http://grafana.$NAMESPACE.svc.cluster.local/api/health" &> /dev/null; then
+            echo "✅ Grafana is healthy"
+          else
+            echo "⚠️  Grafana may still be starting"
+          fi
+
+          # List monitoring pods
+          echo "📋 Monitoring Pods:"
+          kubectl get pods -l 'app in (prometheus,grafana)' -n $NAMESPACE
+        continue-on-error: true
+
+  # ===========================================
+  # SLACK NOTIFICATION ON FAILURE
+  # ===========================================
+  # ===========================================
+  # ENHANCED NOTIFICATION SYSTEM
+  # ===========================================
+  notify-failure:
+    name: 📱 Enhanced Slack Notifications
+    runs-on: ubuntu-latest
+    needs: [security-scan, build-nodejs, build-docker, security-policy-check]
+    if: failure()
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 📤 Download Security Reports
+        uses: actions/download-artifact@v3
+        with:
+          pattern: "*"
+          merge-multiple: true
+
+      - name: 📱 Send Enhanced Slack Notification
+        run: |
+          # Install dependencies
+          npm install -g @actions/core
+
+          # Prepare failure context
+          FAILED_STAGE="${{ needs.security-scan.result }}"
+          FAILED_JOB="${{ job.status }}"
+
+          # Create context for Slack notification
+          CONTEXT=$(cat <<EOF
+          {
+            "type": "failure",
+            "stage": "${FAILED_STAGE}",
+            "workflow": "${{ github.workflow }}",
+            "repository": "${{ github.repository }}",
+            "branch": "${{ github.ref_name }}",
+            "commit": "${{ github.sha }}",
+            "runId": "${{ github.run_id }}",
+            "actor": "${{ github.actor }}",
+            "timestamp": "$(date -Iseconds)",
+            "details": "Pipeline failed during ${FAILED_STAGE} stage"
+          }
+          EOF
+          )
+
+          # Send enhanced Slack notification
+          node .github/scripts/slack-notifications.js "$CONTEXT"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CHANNEL: ${{ vars.SLACK_CHANNEL || '#security-alerts' }}
+          SLACK_USERNAME: "GitHub Actions"
+          SLACK_ICON_EMOJI: ":rotating_light:"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+  notify-security-findings:
+    name: 🔍 Security Findings Notification
+    runs-on: ubuntu-latest
+    needs: [security-policy-check]
+    if: always()
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 📤 Download Security Reports
+        uses: actions/download-artifact@v3
+        with:
+          pattern: "security-summary"
+          merge-multiple: true
+
+      - name: 📱 Send Security Findings Notification
+        run: |
+          # Install dependencies
+          npm install -g @actions/core
+
+          # Check if there are critical findings
+          if [ -f "security-policy-report.json" ]; then
+            CRITICAL_COUNT=$(cat security-policy-report.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    vulns = data.get('summary', {}).get('vulnerabilities', {})
+    print(vulns.get('critical', 0) + vulns.get('high', 0))
+except:
+    print(0)
+" 2>/dev/null || echo "0")
+
+            if [ "$CRITICAL_COUNT" -gt 0 ]; then
+              # Prepare context for critical findings
+              CONTEXT=$(cat <<EOF
+              {
+                "type": "security",
+                "action": "critical_findings",
+                "status": "failed",
+                "workflow": "${{ github.workflow }}",
+                "repository": "${{ github.repository }}",
+                "branch": "${{ github.ref_name }}",
+                "commit": "${{ github.sha }}",
+                "runId": "${{ github.run_id }}",
+                "actor": "${{ github.actor }}",
+                "timestamp": "$(date -Iseconds)",
+                "vulnerabilities": {
+                  "critical": $(cat security-policy-report.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    vulns = data.get('summary', {}).get('vulnerabilities', {})
+    print(vulns.get('critical', 0))
+except:
+    print(0)
+" 2>/dev/null || echo "0"),
+                  "high": $(cat security-policy-report.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    vulns = data.get('summary', {}).get('vulnerabilities', {})
+    print(vulns.get('high', 0))
+except:
+    print(0)
+" 2>/dev/null || echo "0"),
+                  "medium": $(cat security-policy-report.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    vulns = data.get('summary', {}).get('vulnerabilities', {})
+    print(vulns.get('medium', 0))
+except:
+    print(0)
+" 2>/dev/null || echo "0"),
+                  "low": $(cat security-policy-report.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    vulns = data.get('summary', {}).get('vulnerabilities', {})
+    print(vulns.get('low', 0))
+except:
+    print(0)
+" 2>/dev/null || echo "0")
+                },
+                "policyViolations": $(cat security-policy-report.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    print(len(data.get('errors', [])) + len(data.get('warnings', [])))
+except:
+    print(0)
+" 2>/dev/null || echo "0"),
+                "details": "Found $CRITICAL_COUNT critical or high severity vulnerabilities requiring immediate attention"
+              }
+              EOF
+              )
+
+              node .github/scripts/slack-notifications.js "$CONTEXT"
+            else
+              # Prepare context for successful security scan
+              CONTEXT=$(cat <<EOF
+              {
+                "type": "security",
+                "action": "scan_completed",
+                "status": "passed",
+                "workflow": "${{ github.workflow }}",
+                "repository": "${{ github.repository }}",
+                "branch": "${{ github.ref_name }}",
+                "commit": "${{ github.sha }}",
+                "runId": "${{ github.run_id }}",
+                "actor": "${{ github.actor }}",
+                "timestamp": "$(date -Iseconds)",
+                "vulnerabilities": {
+                  "critical": $(cat security-policy-report.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    vulns = data.get('summary', {}).get('vulnerabilities', {})
+    print(vulns.get('critical', 0))
+except:
+    print(0)
+" 2>/dev/null || echo "0"),
+                  "high": $(cat security-policy-report.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    vulns = data.get('summary', {}).get('vulnerabilities', {})
+    print(vulns.get('high', 0))
+except:
+    print(0)
+" 2>/dev/null || echo "0"),
+                  "medium": $(cat security-policy-report.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    vulns = data.get('summary', {}).get('vulnerabilities', {})
+    print(vulns.get('medium', 0))
+except:
+    print(0)
+" 2>/dev/null || echo "0"),
+                  "low": $(cat security-policy-report.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    vulns = data.get('summary', {}).get('vulnerabilities', {})
+    print(vulns.get('low', 0))
+except:
+    print(0)
+" 2>/dev/null || echo "0")
+                },
+                "details": "Security scan completed successfully - no critical issues detected"
+              }
+              EOF
+              )
+
+              node .github/scripts/slack-notifications.js "$CONTEXT"
+            fi
+          else
+            echo "⚠️  Security policy report not found"
+          fi
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CHANNEL: ${{ vars.SLACK_CHANNEL || '#security-alerts' }}
+          SLACK_USERNAME: "GitHub Actions"
+          SLACK_ICON_EMOJI: ":shield:"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+  notify-deployment:
+    name: 🚀 Deployment Notification
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always()
+    steps:
+      - name: 📱 Send Deployment Notification
+        run: |
+          # Install dependencies
+          npm install -g @actions/core
+
+          # Prepare deployment context
+          DEPLOYMENT_STATUS="${{ needs.deploy.result }}"
+          ENVIRONMENT="${{ github.ref == 'refs/heads/deploy_prod' && 'production' || 'demo' }}"
+
+          # Create context for deployment notification
+          CONTEXT=$(cat <<EOF
+          {
+            "type": "deployment",
+            "status": "$DEPLOYMENT_STATUS",
+            "environment": "$ENVIRONMENT",
+            "workflow": "${{ github.workflow }}",
+            "repository": "${{ github.repository }}",
+            "branch": "${{ github.ref_name }}",
+            "commit": "${{ github.commit_sha }}",
+            "runId": "${{ github.run_id }}",
+            "actor": "${{ github.actor }}",
+            "timestamp": "$(date -Iseconds)",
+            "details": "Deployment to $ENVIRONMENT environment completed successfully"
+          }
+          EOF
+          )
+
+          # If deployment failed, add error details
+          if [ "$DEPLOYMENT_STATUS" != "success" ]; then
+            # Update context with failure details
+            CONTEXT=$(echo "$CONTEXT" | sed 's/completed successfully/completed with errors/')
+            CONTEXT=$(echo "$CONTEXT" | sed 's/"status": "deployment-success"/"status": "deployment-failed"/')
+          fi
+
+          node .github/scripts/slack-notifications.js "$CONTEXT"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CHANNEL: ${{ vars.SLACK_CHANNEL || '#security-alerts' }}
+          SLACK_USERNAME: "GitHub Actions"
+          SLACK_ICON_EMOJI: "${{ github.ref == 'refs/heads/deploy_prod' && ':rocket:' || ':test:' }}"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true

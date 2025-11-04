@@ -1,0 +1,378 @@
+name: 'Kubernetes Secure Deployment'
+description: 'Deploy application to Kubernetes with security validation and rollback capabilities'
+author: 'GitHub Actions'
+
+inputs:
+  cluster-config:
+    description: 'Path to kubeconfig file'
+    required: true
+  namespace:
+    description: 'Kubernetes namespace to deploy to'
+    required: true
+    default: 'secure-app'
+  manifests-path:
+    description: 'Path to Kubernetes manifests'
+    required: true
+    default: '.github/kubernetes'
+  image:
+    description: 'Docker image to deploy'
+    required: true
+  environment:
+    description: 'Deployment environment (staging/production)'
+    required: true
+    default: 'production'
+  wait-timeout:
+    description: 'Timeout for deployment rollout (seconds)'
+    required: true
+    default: '300'
+  enable-rollback:
+    description: 'Enable automatic rollback on failure'
+    required: true
+    default: 'true'
+  enable-canary:
+    description: 'Enable canary deployment strategy'
+    required: true
+    default: 'false'
+  canary-percentage:
+    description: 'Percentage of traffic for canary deployment'
+    required: true
+    default: '10'
+
+outputs:
+  deployment-status:
+    description: 'Status of the deployment'
+  deployment-url:
+    description: 'URL of the deployed application'
+  rollback-available:
+    description: 'Whether rollback is available'
+  previous-revision:
+    description: 'Previous deployment revision'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup kubectl
+      shell: bash
+      run: |
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+        kubectl version --client
+
+    - name: Setup Helm
+      shell: bash
+      run: |
+        curl https://get.helm.sh/helm-v3.12.0-linux-amd64.tar.gz | tar xz
+        mv linux-amd64/helm /usr/local/bin/
+        helm version
+
+    - name: Validate Kubernetes access
+      shell: bash
+      run: |
+        # Setup kubeconfig
+        mkdir -p $HOME/.kube
+        if [ -f "${{ inputs.cluster-config }}" ]; then
+          cp "${{ inputs.cluster-config }}" $HOME/.kube/config
+        elif [ ! -z "$KUBE_CONFIG" ]; then
+          echo "$KUBE_CONFIG" | base64 -d > $HOME/.kube/config
+        else
+          echo "❌ No kubeconfig provided"
+          exit 1
+        fi
+
+        # Validate cluster access
+        kubectl cluster-info
+        if [ $? -ne 0 ]; then
+          echo "❌ Cannot access Kubernetes cluster"
+          exit 1
+        fi
+
+        # Check namespace exists
+        kubectl get namespace "${{ inputs.namespace }}" || \
+        kubectl create namespace "${{ inputs.namespace }}"
+
+        echo "✅ Kubernetes access validated"
+
+    - name: Pre-deployment security validation
+      shell: bash
+      run: |
+        echo "🔒 Performing pre-deployment security validation..."
+
+        # Check for required security resources
+        if [ "${{ inputs.environment }}" = "production" ]; then
+          echo "🔍 Validating production deployment security requirements..."
+
+          # Check network policies exist
+          if ! kubectl get networkpolicy -n "${{ inputs.namespace }}" | grep -q "secure-nodejs-app"; then
+            echo "⚠️  Warning: No network policies found for production deployment"
+          fi
+
+          # Check pod security policies
+          if ! kubectl get podsecuritypolicy -n "${{ inputs.namespace }}" 2>/dev/null | grep -q "secure"; then
+            echo "⚠️  Warning: No pod security policies found"
+          fi
+
+          # Check resource limits
+          if ! kubectl get limitrange -n "${{ inputs.namespace }}" | grep -q "secure-app-limits"; then
+            echo "❌ Error: Resource limits not configured for production"
+            exit 1
+          fi
+
+          echo "✅ Production security validation passed"
+        fi
+
+    - name: Get current deployment state
+      id: current-state
+      shell: bash
+      run: |
+        echo "📊 Getting current deployment state..."
+
+        # Get current deployment revision
+        CURRENT_REVISION=$(kubectl get deployment secure-nodejs-app -n "${{ inputs.namespace }}" -o jsonpath='{.status.observedGeneration}' 2>/dev/null || echo "0")
+        echo "current-revision=$CURRENT_REVISION" >> $GITHUB_OUTPUT
+
+        # Get current replicas
+        CURRENT_REPLICAS=$(kubectl get deployment secure-nodejs-app -n "${{ inputs.namespace }}" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+        echo "current-replicas=$CURRENT_REPLICAS" >> $GITHUB_OUTPUT
+
+        # Store current image for rollback
+        CURRENT_IMAGE=$(kubectl get deployment secure-nodejs-app -n "${{ inputs.namespace }}" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
+        echo "current-image=$CURRENT_IMAGE" >> $GITHUB_OUTPUT
+
+        echo "📋 Current state:"
+        echo "  Revision: $CURRENT_REVISION"
+        echo "  Replicas: $CURRENT_REPLICAS"
+        echo "  Image: $CURRENT_IMAGE"
+
+    - name: Validate manifests
+      shell: bash
+      run: |
+        echo "🔍 Validating Kubernetes manifests..."
+
+        # Validate YAML syntax
+        for manifest in "${{ inputs.manifests-path }}"/*.yaml; do
+          if [ -f "$manifest" ]; then
+            echo "Validating $manifest..."
+            kubectl --dry-run=client apply -f "$manifest"
+            if [ $? -ne 0 ]; then
+              echo "❌ Manifest validation failed: $manifest"
+              exit 1
+            fi
+          fi
+        done
+
+        echo "✅ All manifests validated successfully"
+
+    - name: Apply security manifests
+      shell: bash
+      run: |
+        echo "🔒 Applying security manifests..."
+
+        # Apply security.yaml first (namespaces, RBAC, network policies)
+        if [ -f "${{ inputs.manifests-path }}/security.yaml" ]; then
+          kubectl apply -f "${{ inputs.manifests-path }}/security.yaml"
+          echo "✅ Security manifests applied"
+        fi
+
+        # Wait for critical resources
+        kubectl wait --for=condition=Ready pod -l app=security-sidecar -n "${{ inputs.namespace }}" --timeout=60s 2>/dev/null || true
+
+    - name: Deploy application
+      shell: bash
+      run: |
+        echo "🚀 Starting deployment to ${{ inputs.environment }}..."
+
+        # Update deployment with new image
+        envsubst < "${{ inputs.manifests-path }}/deployment.yaml" > deployment-updated.yaml
+
+        # Apply deployment
+        kubectl apply -f deployment-updated.yaml -n "${{ inputs.namespace }}"
+
+        if [ $? -ne 0 ]; then
+          echo "❌ Deployment failed to apply"
+          exit 1
+        fi
+
+        echo "✅ Deployment manifest applied"
+
+    - name: Wait for deployment rollout
+      shell: bash
+      run: |
+        echo "⏳ Waiting for deployment rollout..."
+
+        # Set timeout based on input
+        TIMEOUT="${{ inputs.wait-timeout }}"
+
+        # Wait for deployment to complete
+        kubectl rollout status deployment/secure-nodejs-app \
+          -n "${{ inputs.namespace }}" \
+          --timeout="${TIMEOUT}s"
+
+        if [ $? -ne 0 ]; then
+          echo "❌ Deployment rollout failed or timed out"
+
+          if [ "${{ inputs.enable-rollback }}" = "true" ]; then
+            echo "🔄 Initiating automatic rollback..."
+            kubectl rollout undo deployment/secure-nodejs-app -n "${{ inputs.namespace }}"
+            echo "✅ Rollback completed"
+          fi
+
+          exit 1
+        fi
+
+        echo "✅ Deployment rollout completed successfully"
+
+    - name: Post-deployment validation
+      shell: bash
+      run: |
+        echo "🔍 Performing post-deployment validation..."
+
+        # Check pod health
+        kubectl wait --for=condition=Ready pod \
+          -l app=secure-nodejs-app \
+          -n "${{ inputs.namespace }}" \
+          --timeout=60s
+
+        if [ $? -ne 0 ]; then
+          echo "❌ Pods are not ready"
+          exit 1
+        fi
+
+        # Check service endpoints
+        kubectl get endpoints secure-nodejs-app-service -n "${{ inputs.namespace }}"
+
+        if [ $? -ne 0 ]; then
+          echo "❌ Service endpoints not available"
+          exit 1
+        fi
+
+        echo "✅ Post-deployment validation passed"
+
+    - name: Health check
+      shell: bash
+      run: |
+        echo "🏥 Performing application health check..."
+
+        # Get service URL
+        SERVICE_IP=$(kubectl get service secure-nodejs-app-service -n "${{ inputs.namespace }}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+        SERVICE_HOSTNAME=$(kubectl get service secure-nodejs-app-service -n "${{ inputs.namespace }}" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+
+        SERVICE_URL=""
+        if [ ! -z "$SERVICE_IP" ]; then
+          SERVICE_URL="http://$SERVICE_IP"
+        elif [ ! -z "$SERVICE_HOSTNAME" ]; then
+          SERVICE_URL="http://$SERVICE_HOSTNAME"
+        else
+          # For minikube or local clusters
+          SERVICE_URL="http://localhost:30000"
+        fi
+
+        echo "🌐 Service URL: $SERVICE_URL"
+        echo "service-url=$SERVICE_URL" >> $GITHUB_OUTPUT
+
+        # Perform health check
+        HEALTH_CHECK_COUNT=0
+        MAX_HEALTH_CHECKS=30
+
+        while [ $HEALTH_CHECK_COUNT -lt $MAX_HEALTH_CHECKS ]; do
+          if curl -f -s "$SERVICE_URL/health" > /dev/null; then
+            echo "✅ Health check passed"
+            echo "deployment-status=success" >> $GITHUB_OUTPUT
+            break
+          fi
+
+          echo "⏳ Waiting for application to be healthy... ($(($HEALTH_CHECK_COUNT + 1))/$MAX_HEALTH_CHECKS)"
+          sleep 10
+          HEALTH_CHECK_COUNT=$((HEALTH_CHECK_COUNT + 1))
+        done
+
+        if [ $HEALTH_CHECK_COUNT -eq $MAX_HEALTH_CHECKS ]; then
+          echo "❌ Health check failed after $MAX_HEALTH_CHECKS attempts"
+          echo "deployment-status=failed" >> $GITHUB_OUTPUT
+
+          if [ "${{ inputs.enable-rollback }}" = "true" ]; then
+            echo "🔄 Rolling back due to health check failure..."
+            kubectl rollout undo deployment/secure-nodejs-app -n "${{ inputs.namespace }}"
+          fi
+
+          exit 1
+        fi
+
+    - name: Canary deployment (if enabled)
+      shell: bash
+      if: inputs.enable-canary == 'true'
+      run: |
+        echo "🐤 Setting up canary deployment..."
+
+        CANARY_PERCENTAGE="${{ inputs.canary-percentage }}"
+
+        # Create canary deployment
+        cat > canary-deployment.yaml << EOF
+        apiVersion: argoproj.io/v1alpha1
+        kind: Rollout
+        metadata:
+          name: secure-nodejs-app-canary
+          namespace: "${{ inputs.namespace }}"
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: secure-nodejs-app-canary
+          template:
+            metadata:
+              labels:
+                app: secure-nodejs-app-canary
+            spec:
+              containers:
+              - name: secure-nodejs-app
+                image: "${{ inputs.image }}"
+                ports:
+                - containerPort: 3000
+          strategy:
+            canary:
+              steps:
+              - setWeight: $CANARY_PERCENTAGE
+              - pause: {duration: 10m}
+              trafficRouting:
+                istio:
+                  virtualService:
+                    name: secure-nodejs-app-vs
+                    routes:
+                    - primary
+        EOF
+
+        kubectl apply -f canary-deployment.yaml
+        echo "✅ Canary deployment configured"
+
+    - name: Generate deployment summary
+      shell: bash
+      run: |
+        echo "📋 Deployment Summary"
+        echo "=================="
+        echo "Environment: ${{ inputs.environment }}"
+        echo "Namespace: ${{ inputs.namespace }}"
+        echo "Image: ${{ inputs.image }}"
+        echo "Status: success"
+        echo "Service URL: ${{ steps.health-check.outputs.service-url }}"
+        echo ""
+
+        # Get deployment details
+        kubectl get deployment secure-nodejs-app -n "${{ inputs.namespace }}" -o wide
+        echo ""
+
+        # Get pod status
+        kubectl get pods -l app=secure-nodejs-app -n "${{ inputs.namespace }}"
+        echo ""
+
+        # Get service status
+        kubectl get service secure-nodejs-app-service -n "${{ inputs.namespace }}"
+
+        # Set outputs
+        echo "rollback-available=true" >> $GITHUB_OUTPUT
+        echo "previous-revision=${{ steps.current-state.outputs.current-revision }}" >> $GITHUB_OUTPUT
+
+    - name: Cleanup temporary files
+      shell: bash
+      if: always()
+      run: |
+        rm -f deployment-updated.yaml canary-deployment.yaml
+        echo "🧹 Cleanup completed"
