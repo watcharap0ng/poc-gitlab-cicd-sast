@@ -1,0 +1,77 @@
+# Semgrep configuration for Node.js security scanning
+rules:
+  # Node.js security rules
+  - id: nodejs-insecure-eval
+    patterns:
+      - pattern: eval($INPUT)
+    message: "Use of eval() is dangerous and can lead to code injection"
+    severity: ERROR
+    languages: [javascript]
+
+  - id: nodejs-hardcoded-secret
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $SECRET = "..."
+          - pattern: |
+              $API_KEY = "..."
+          - pattern: |
+              $PASSWORD = "..."
+          - pattern: |
+              $TOKEN = "..."
+    message: "Hardcoded secret detected"
+    severity: ERROR
+    languages: [javascript]
+
+  - id: nodejs-sql-injection
+    patterns:
+      - pattern: |
+          db.query($QUERY + $INPUT)
+      - pattern: |
+          db.query("... " + $INPUT)
+    message: "Potential SQL injection vulnerability"
+    severity: ERROR
+    languages: [javascript]
+
+  - id: nodejs-path-traversal
+    patterns:
+      - pattern: |
+          fs.readFile($INPUT + $FILENAME)
+    message: "Potential path traversal vulnerability"
+    severity: ERROR
+    languages: [javascript]
+
+  - id: nodejs-xss
+    patterns:
+      - pattern: |
+          res.send($USER_INPUT)
+    message: "Potential XSS vulnerability - user input should be sanitized"
+    severity: WARNING
+    languages: [javascript]
+
+  - id: nodejs-weak-crypto
+    patterns:
+      - pattern-either:
+          - pattern: |
+              crypto.createHash('md5')
+          - pattern: |
+              crypto.createHash('sha1')
+    message: "Weak cryptographic algorithm detected"
+    severity: WARNING
+    languages: [javascript]
+
+  - id: nodejs-debug-enabled
+    patterns:
+      - pattern: |
+              process.env.NODE_ENV === 'development'
+    message: "Debug mode may be enabled in production"
+    severity: INFO
+    languages: [javascript]
+
+# Include standard Node.js rules
+include:
+  - p/nodejs
+  - p/express
+  - p/security
+  - p/owasp-top-ten
+  - p/javascript

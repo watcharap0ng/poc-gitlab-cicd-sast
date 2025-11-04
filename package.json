@@ -1,0 +1,82 @@
+{
+  "name": "nodejs-sast-app",
+  "version": "1.0.0",
+  "description": "Node.js application with SAST security scanning",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "build": "npm run lint && npm run test && npm run compile",
+    "compile": "echo 'Compiling application...' && mkdir -p dist && cp -r src/* dist/",
+    "test": "jest --coverage --ci",
+    "test:watch": "jest --watch",
+    "lint": "eslint src/ --fix",
+    "lint:check": "eslint src/",
+    "security:audit": "npm audit --audit-level=high",
+    "security:check": "npm audit",
+    "precommit": "npm run lint:check && npm run test && npm run security:audit",
+    "docker:build": "docker build -t nodejs-sast-app .",
+    "docker:run": "docker run -p 3000:3000 nodejs-sast-app"
+  },
+  "keywords": [
+    "nodejs",
+    "security",
+    "sast",
+    "gitlab-ci",
+    "devops"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "helmet": "^7.1.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "compression": "^1.7.4",
+    "morgan": "^1.10.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^6.3.3",
+    "eslint": "^8.55.0",
+    "eslint-config-standard": "^17.1.0",
+    "eslint-plugin-import": "^2.29.0",
+    "eslint-plugin-node": "^11.1.0",
+    "eslint-plugin-promise": "^6.1.1",
+    "nodemon": "^3.0.2",
+    "@types/jest": "^29.5.8"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=8.0.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "collectCoverageFrom": [
+      "src/**/*.js",
+      "!src/index.js"
+    ],
+    "coverageDirectory": "coverage",
+    "coverageReporters": [
+      "text",
+      "lcov",
+      "html"
+    ],
+    "testMatch": [
+      "**/tests/**/*.test.js"
+    ]
+  },
+  "eslintConfig": {
+    "extends": "standard",
+    "env": {
+      "node": true,
+      "es2022": true,
+      "jest": true
+    },
+    "rules": {
+      "no-console": "warn",
+      "prefer-const": "error",
+      "no-var": "error"
+    }
+  }
+}

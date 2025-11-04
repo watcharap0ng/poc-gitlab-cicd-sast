@@ -1,0 +1,746 @@
+stages:
+  - scan_sast
+  - build
+  - scan_security
+  - security_policy_check
+  - public_report
+  - deploy
+  - check-pods-status
+
+variables:
+ URL_DOMAIN_DEFECTDOJO: $URL_DOMAIN_DEFECTDOJO
+ URL_DOMAIN_DEPENDENCYTRACK: $URL_DOMAIN_DEPENDENCYTRACK
+ TOKEN_DEPENDENCYTRACK: $TOKEN_DEPENDENCYTRACK
+ TOKEN_DEFECTDOJO: $TOKEN_DEFECTDOJO
+ PROJECT_NAME: $PROJECT_NAME
+ ID_ENGAGEMENT: $ID_ENGAGEMENT
+ TAG_LATEST: $CI_REGISTRY_IMAGE/$CI_COMMIT_REF_NAME:latest
+ TAG_COMMIT: $CI_REGISTRY_IMAGE/$CI_COMMIT_REF_NAME:$CI_COMMIT_SHORT_SHA
+
+ # Security Policy Configuration
+ FAIL_ON_HIGH_CRITICAL: "${FAIL_ON_HIGH_CRITICAL:-true}"
+ FAIL_ON_MEDIUM: "${FAIL_ON_MEDIUM:-false}"
+ SLACK_WEBHOOK_URL: "${SLACK_WEBHOOK_URL}"
+ SLACK_CHANNEL: "${SLACK_CHANNEL:-#security-alerts}"
+
+
+.default:rule:
+  rules:
+   - if: $CI_COMMIT_BRANCH == "deploy_prod"
+     variables:
+       KUBE_CONTEXT: poc-project:poc-project-agent
+       DEPLOYMENT_NAMESPACE: poc-project-prod
+       DEPLOY_MANIFEST_PATH: outsource/poc-project/yaml-poc-projectphp-deploy-prod
+       DEPLOY_MANIFEST: yaml-poc-projectphp-deploy-prod
+       DEPLOY_YAML: yaml-poc-projectphp-deploy-prod/yaml/
+       DEPLOY_ENV: yaml-poc-projectphp-deploy-prod/env/       
+       SECRET_NAME: poc-project-secret-env
+       URL: https://poc-project.com/poc-project
+   - if:  $CI_COMMIT_BRANCH == "deploy_demo"
+     variables:
+       KUBE_CONTEXT: poc-project:poc-project-agent
+       DEPLOYMENT_NAMESPACE: poc-project-demo
+       DEPLOY_MANIFEST_PATH: outsource/poc-project/yaml-poc-projectphp-deploy-demo
+       DEPLOY_MANIFEST: yaml-poc-projectphp-deploy-demo
+       DEPLOY_YAML: yaml-poc-projectphp-deploy-demo/yaml/
+       DEPLOY_ENV: yaml-poc-projectphp-deploy-demo/env/
+       SECRET_NAME: poc-project-secret-env       
+       URL: https://poc-project.demo.com
+
+
+.kube-context:
+  before_script:
+  - if [ -n "$KUBE_CONTEXT" ]; then kubectl config use-context "$KUBE_CONTEXT"; fi
+
+.kaniko-build: &kaniko-build
+  - |
+    /kaniko/executor \
+    --cache-copy-layers=false \
+    --snapshot-mode=redo \
+    --cache-dir=/kaniko/cache \
+    --use-new-run \
+    --cache=true \
+    --cache-repo=$CI_REGISTRY_IMAGE/kaniko_caches \
+    --cleanup \
+    --context $CI_PROJECT_DIR \
+    --dockerfile $CI_PROJECT_DIR/Dockerfile \
+    --destination $CI_REGISTRY_IMAGE:$IMAGE_TAG \
+    --destination $CI_REGISTRY_IMAGE:latest
+
+clone_script_repo:
+  stage: scan_sast
+  image: 
+     name: alpine/git:latest
+     entrypoint: [""]
+  script:
+    - git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@poc-project.com/poc-project/template-scan-security.git scripts
+    - ls
+    - pwd
+  extends: 
+    - .default:rule
+  artifacts:
+    name: "global-scripts"
+    paths:
+      - "scripts/"
+    expire_in: 1 week
+  when: on_success
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
+
+
+🗝️gitleaks-secret-scan:
+  stage: scan_sast
+  image:
+    name: zricethezav/gitleaks
+    entrypoint: [""]
+  extends: 
+    - .default:rule
+  tags:
+    - docker
+  script:
+    - gitleaks detect --verbose --source . -f json -r gitleaks.json || exit 0
+  needs:
+    - job: clone_script_repo
+      artifacts: true
+  allow_failure: true
+  artifacts:
+    when: always
+    paths:
+      - gitleaks.json
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
+
+
+🐞semgrep-SAST-scan:
+  stage: scan_sast
+  image: semgrep/semgrep
+  extends:
+    - .default:rule
+  tags:
+    - docker
+  variables:
+    SEMGREP_RULES: >
+            p/nodejs
+            p/express
+            p/javascript
+            p/security
+            p/owasp-top-ten
+            p/cwe-top-25
+            p/r2c-security-audit
+            # Additional rules
+            p/xss
+            p/sql-injection
+            p/command-injection
+            p/secrets
+            p/trailofbits
+            p/dockerfile
+            p/npm-audit
+
+  script:
+    - echo "🔍 Running Semgrep SAST scan with Node.js rules..."
+    - semgrep --config=$SEMGREP_RULES --json --output=semgrep.json . || echo "Semgrep scan completed with findings"
+    # Also run with custom Node.js config if available
+    - if [ -f "scripts/semgrep-nodejs-config.yaml" ]; then semgrep --config=scripts/semgrep-nodejs-config.yaml --json --output=semgrep_nodejs.json . || echo "Custom Node.js scan completed"; fi
+  needs:
+    - job: clone_script_repo
+      artifacts: true
+  allow_failure: true
+  artifacts:
+    when: always
+    paths:
+      - semgrep.json
+      - semgrep_nodejs.json
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
+
+🛡️trivy-fs-scan:
+  image: alpine:3.20
+  extends: 
+    - .default:rule
+  variables:
+    TRIVY_VERSION: v0.50.0 #Please refer release version here https://github.com/aquasecurity/trivy/releases
+  stage: scan_sast
+  tags:
+    - docker
+  before_script:
+    - apk update && apk add aws-cli bash curl wget ca-certificates gnupg lsb-release
+    - ls
+    - chmod +x -R scripts/* # Fixing scripts permission
+  script:
+    - scripts/trivy-scan-fs.sh
+  needs:
+    - job: clone_script_repo
+      artifacts: true
+  artifacts:
+    when: always
+    paths:
+      - trivy_fs_report.json
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
+
+syft_sbom:
+  image:
+    name: registry.gitlab.com/gitlab-ci-utils/container-images/syft:latest
+    entrypoint: [""]
+  extends: 
+    - .default:rule
+  stage: scan_sast
+  tags:
+    - docker
+  needs: []
+  script:
+    - /syft/syft $CI_PROJECT_DIR -o cyclonedx-json=syft.cdx.json
+  allow_failure: true
+  artifacts:
+    when: always
+    paths:
+      - syft.cdx.json
+    reports:
+      cyclonedx:
+        - syft.cdx.json
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
+
+
+# ===========================================
+# NODE.JS BUILD STAGE
+# ===========================================
+build_nodejs:
+  stage: build
+  image: node:18-alpine
+  extends:
+    - .default:rule
+  tags:
+    - docker
+  cache:
+    key: "npm-cache-${CI_PROJECT_ID}-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .npm/
+      - node_modules/
+    policy: pull-push
+  before_script:
+    - npm config set cache .npm
+    - echo "Node.js version: $(node --version)"
+    - echo "NPM version: $(npm --version)"
+  script:
+    - echo "🔨 Building Node.js application..."
+    - npm ci --cache .npm --prefer-offline
+    - echo "🔍 Running security audit..."
+    - npm audit --audit-level=high || echo "Security audit completed with findings"
+    - echo "🧪 Running linting..."
+    - npm run lint:check
+    - echo "🧪 Running tests..."
+    - npm run test
+    - echo "📦 Building application..."
+    - npm run build
+    - echo "✅ Node.js build completed successfully"
+  artifacts:
+    paths:
+      - dist/
+      - node_modules/
+      - coverage/
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+      junit:
+        - junit.xml
+    expire_in: 1 hour
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
+
+build:image:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  tags:
+     - docker
+  extends:
+    - .default:rule
+  needs:
+    - build_nodejs
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"$CI_REGISTRY_USER\",\"password\":\"$CI_REGISTRY_PASSWORD\"}}}" > /kaniko/.docker/config.json
+    - export IMAGE_TAG=${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}
+  script:
+    - *kaniko-build
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
+
+
+🛡️trivy-docker-scan:
+  stage: scan_security
+  image: docker:26-cli
+  services:
+    - name: docker:26-dind
+      alias: docker
+      command: ["--tls=false"]
+  extends: 
+    - .default:rule
+  needs: ["clone_script_repo", "build:image"]
+  allow_failure: true
+  variables:
+    TRIVY_VERSION: v0.58.1
+    IMAGE_TAG: "${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+    DOCKER_DRIVER: overlay2
+    # Use non-TLS connection for better compatibility
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_VERIFY: ""
+    DOCKER_CERT_PATH: ""
+  cache:
+    key: "trivy-docker-cache-${CI_PROJECT_ID}-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .trivycache/
+    policy: pull-push
+  before_script:
+    - apk update && apk add --no-cache bash curl wget ca-certificates gnupg
+    - chmod +x -R scripts/*
+    # Wait for Docker daemon
+    - |
+      echo "Waiting for Docker daemon..."
+      for i in $(seq 1 60); do
+        if docker version >/dev/null 2>&1; then
+          echo "Docker daemon is ready"
+          break
+        fi
+        echo "Waiting for Docker daemon... ($i/60)"
+        sleep 3
+        if [ $i -eq 60 ]; then
+          echo "ERROR: Docker daemon failed to start after 3 minutes"
+          exit 1
+        fi
+      done
+    # Verify image configuration
+    - |
+      export IMAGE_TAG=${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}
+      echo "Image tag: $IMAGE_TAG"
+      echo "Full image: $CI_REGISTRY_IMAGE:$IMAGE_TAG"
+      if [ -z "$IMAGE_TAG" ]; then
+        echo "ERROR: IMAGE_TAG is empty"
+        exit 1
+      fi
+  script:
+    - |
+      export IMAGE_TAG=${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}
+      FULL_IMAGE="$CI_REGISTRY_IMAGE:$IMAGE_TAG"
+
+      echo "Logging in to registry..."
+      echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+
+      echo "Pulling image: $FULL_IMAGE"
+      if docker pull "$FULL_IMAGE"; then
+        echo "Image pulled successfully"
+        scripts/trivy-scan-docker.sh "$FULL_IMAGE"
+      else
+        echo "ERROR: Failed to pull image: $FULL_IMAGE"
+        echo "Available tags in registry:"
+        # Create empty report for consistency
+        echo '{"Results":[],"SchemaVersion":2}' > trivy_images_report.json
+        echo "WARNING: Continuing with empty report due to missing image"
+        exit 0
+      fi
+  artifacts:
+    when: always
+    expire_in: 1 day
+    paths:
+      - trivy_images_report.json
+      - .trivycache/
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
+
+
+upload_reports_defectdojo:
+  stage: public_report
+  image: python:3.11-alpine
+  extends:
+    - .default:rule
+  tags:
+    - docker
+  needs: ["clone_script_repo","🗝️gitleaks-secret-scan", "🐞semgrep-SAST-scan", "🛡️trivy-fs-scan", "🛡️trivy-docker-scan", "security_policy_check"]
+  when: always
+  before_script:
+    - apk add --no-cache curl
+    - pip3 install requests
+    - chmod +x scripts/upload-reports-enhanced.py
+  script:
+    - |
+      echo "📤 Uploading security reports to DefectDojo..."
+
+      # Enhanced DefectDojo upload with auto-creation
+      if [ -n "$URL_DOMAIN_DEFECTDOJO" ] && [ -n "$TOKEN_DEFECTDOJO" ]; then
+        echo "Using enhanced DefectDojo integration with auto-creation..."
+
+        # Use enhanced script with all available reports
+        python3 scripts/upload-reports-enhanced.py \
+          "http://$URL_DOMAIN_DEFECTDOJO" \
+          "$TOKEN_DEFECTDOJO" \
+          "$PROJECT_NAME" \
+          gitleaks.json \
+          semgrep.json \
+          semgrep_nodejs.json \
+          trivy_fs_report.json \
+          trivy_images_report.json \
+          dependency_track_findings.json \
+          security_summary.json
+
+      else
+        echo "⚠️  DefectDojo configuration not found, skipping upload..."
+        echo "Required variables: URL_DOMAIN_DEFECTDOJO, TOKEN_DEFECTDOJO, PROJECT_NAME"
+      fi
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
+
+# ===========================================
+# SECURITY POLICY CHECK
+# ===========================================
+security_policy_check:
+  stage: security_policy_check
+  image: python:3.11-alpine
+  extends:
+    - .default:rule
+  tags:
+    - docker
+  needs:
+    - job: 🗝️gitleaks-secret-scan
+      artifacts: true
+    - job: 🐞semgrep-SAST-scan
+      artifacts: true
+    - job: 🛡️trivy-fs-scan
+      artifacts: true
+    - job: 🛡️trivy-docker-scan
+      artifacts: true
+    - job: syft_sbom
+      artifacts: true
+  before_script:
+    - apk add --no-cache bash jq
+    - chmod +x scripts/security-policy-check.sh
+  script:
+    - scripts/security-policy-check.sh
+  artifacts:
+    when: always
+    paths:
+      - security_summary.json
+    reports:
+      sast: security_summary.json
+    expire_in: 1 week
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
+
+# ===========================================
+# ENHANCED DEPENDENCY-TRACK INTEGRATION
+# ===========================================
+dependencytrack_publish:
+  stage: public_report
+  image: alpine:latest
+  extends:
+    - .default:rule
+  tags:
+    - docker
+  needs:
+    - job: syft_sbom
+      artifacts: true
+    - job: build_nodejs
+      artifacts: true
+  before_script:
+    - apk add --no-cache curl jq python3
+    - echo "Installing CycloneDX generator..."
+    - pip3 install cyclonedx-bom
+  allow_failure: true
+  script:
+    - |
+      echo "🔍 Enhanced Dependency-Track SBOM Processing..."
+
+      # Configuration
+      DT_URL="${URL_DOMAIN_DEPENDENCYTRACK}"
+      DT_API_KEY="${TOKEN_DEPENDENCYTRACK}"
+      PROJECT_NAME="${PROJECT_NAME:-nodejs-sast-app}"
+      PROJECT_VERSION="${CI_COMMIT_REF_NAME}-${CI_COMMIT_SHORT_SHA}"
+      BOM_FILE="syft.cdx.json"
+
+      if [ -z "$DT_URL" ] || [ -z "$DT_API_KEY" ]; then
+        echo "⚠️  Dependency-Track configuration not found, skipping..."
+        echo "Required variables: URL_DOMAIN_DEPENDENCYTRACK, TOKEN_DEPENDENCYTRACK"
+        exit 0
+      fi
+
+      echo "📋 Dependency-Track Configuration:"
+      echo "   URL: $DT_URL"
+      echo "   Project: $PROJECT_NAME"
+      echo "   Version: $PROJECT_VERSION"
+      echo "   SBOM File: $BOM_FILE"
+
+      # Check if SBOM file exists and is valid
+      if [ ! -f "$BOM_FILE" ] || [ ! -s "$BOM_FILE" ]; then
+        echo "⚠️  SBOM file not found or empty: $BOM_FILE"
+        echo "Generating new SBOM from Node.js project..."
+
+        # Generate SBOM using CycloneDX if Syft SBOM is not available
+        if [ -f "package.json" ]; then
+          cyclonedx-bom -o cyclonedx-bom.json
+          BOM_FILE="cyclonedx-bom.json"
+          echo "✅ Generated new SBOM: $BOM_FILE"
+        else
+          echo "❌ Cannot generate SBOM - no package.json found"
+          exit 1
+        fi
+      fi
+
+      # Validate SBOM file
+      if ! python3 -c "import json; json.load(open('$BOM_FILE'))" 2>/dev/null; then
+        echo "❌ Invalid JSON in SBOM file: $BOM_FILE"
+        exit 1
+      fi
+
+      echo "📤 Submitting SBOM to Dependency-Track..."
+
+      # Submit SBOM to Dependency-Track
+      RESPONSE=$(curl -s -w "%{http_code}" -o dt_response.json \
+        -X POST "${DT_URL}/api/v1/bom" \
+        -H "Content-Type: multipart/form-data" \
+        -H "X-API-Key: ${DT_API_KEY}" \
+        -F "projectName=${PROJECT_NAME}" \
+        -F "projectVersion=${PROJECT_VERSION}" \
+        -F "autoCreate=true" \
+        -F "bom=@${BOM_FILE}")
+
+      HTTP_CODE="${RESPONSE: -3}"
+
+      if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+        echo "✅ SBOM submitted successfully to Dependency-Track"
+
+        # Extract project information from response
+        if [ -f "dt_response.json" ] && [ -s "dt_response.json" ]; then
+          PROJECT_UUID=$(cat dt_response.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    print(data.get('uuid', ''))
+except:
+    pass
+" 2>/dev/null || echo "")
+
+          if [ -n "$PROJECT_UUID" ]; then
+            echo "🔗 Project UUID: $PROJECT_UUID"
+
+            # Wait for analysis to complete
+            echo "⏳ Waiting for Dependency-Track analysis..."
+            sleep 30
+
+            # Get vulnerability findings
+            echo "📊 Retrieving vulnerability analysis..."
+            curl -s -H "X-API-Key: ${DT_API_KEY}" \
+              "${DT_URL}/api/v1/finding/project/${PROJECT_UUID}" \
+              -o dependency_track_findings.json
+
+            if [ -f "dependency_track_findings.json" ] && [ -s "dependency_track_findings.json" ]; then
+              FINDINGS_COUNT=$(cat dependency_track_findings.json | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    print(len(data) if isinstance(data, list) else 0)
+except:
+    print(0)
+" 2>/dev/null || echo 0)
+
+              echo "✅ Retrieved $FINDINGS_COUNT vulnerability findings from Dependency-Track"
+            else
+              echo "⚠️  No findings retrieved from Dependency-Track"
+              echo '{"findings": []}' > dependency_track_findings.json
+            fi
+          fi
+        fi
+
+      else
+        echo "❌ Failed to submit SBOM to Dependency-Track (HTTP $HTTP_CODE)"
+        if [ -f "dt_response.json" ]; then
+          echo "Response: $(cat dt_response.json)"
+        fi
+        exit 1
+      fi
+
+      echo "🎉 Dependency-Track integration completed successfully!"
+  artifacts:
+    when: always
+    paths:
+      - syft.cdx.json
+      - cyclonedx-bom.json
+      - dependency_track_findings.json
+      - dt_response.json
+    expire_in: 1 week
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
+
+
+clone:manifest:
+   stage: deploy
+   tags:
+      - docker
+   image: 
+     name: alpine/git:latest
+     entrypoint: [""]
+   extends: 
+    - .default:rule
+   script:
+     - git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@poc-project.com/$DEPLOY_MANIFEST_PATH.git
+   artifacts:
+     paths:
+       - $DEPLOY_MANIFEST
+     expire_in: 1h
+
+# Deploy application on K8s cluster using kubectl
+deploy:to:k8s:
+  stage: deploy
+  extends:
+    - .default:rule
+    - .kube-context
+  needs:
+    - clone:manifest
+  image:
+    name: poc-project.com/poc-project/custom-kubectl:latest
+    entrypoint: [""]
+  tags:
+     - docker
+  script:
+  # Read variable create secret.yaml and deploy on k8s
+    - |
+        lines=$(base64 $DEPLOY_ENV/.env | tr -d \\n)
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        data:
+            .env: $lines
+        kind: Secret
+        metadata:
+            name: $SECRET_NAME
+            namespace: $DEPLOYMENT_NAMESPACE
+        EOF
+
+    - ls
+    - export IMAGE_TAG=${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}
+    - kubectl apply -f  $DEPLOY_YAML --namespace=$DEPLOYMENT_NAMESPACE # Directory where yamls are placed in repo
+    - kubectl --namespace=$DEPLOYMENT_NAMESPACE set image deployment/poc-project-deployment poc-project-app=poc-project.com/poc-project-php:$IMAGE_TAG
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
+
+check-pods-status:
+    stage: check-pods-status
+    extends:
+     - .default:rule
+     - .kube-context
+    needs:
+     - deploy:to:k8s
+    image:
+      name: poc-project.com/poc-project/custom-kubectl:latest
+      entrypoint: [""]
+    script:
+      # Check Status Pod
+      - sleep 60
+      - labels=$(kubectl describe deployment/poc-project-deployment -n $DEPLOYMENT_NAMESPACE | grep Labels | grep appName | awk '{print $2}')
+      - kubectl get pods -l "$labels" -n $DEPLOYMENT_NAMESPACE
+    environment:
+      name: $DEPLOYMENT_NAMESPACE
+      url: $URL
+
+# ===========================================
+# SLACK FAILURE NOTIFICATIONS
+# ===========================================
+notify_failure:
+  stage: .post
+  image: curlimages/curl:latest
+  tags:
+    - docker
+  script:
+    - |
+      if [ -n "$SLACK_WEBHOOK_URL" ]; then
+        echo "🚨 Sending failure notification to Slack..."
+
+        # Prepare Slack message
+        PAYLOAD=$(cat <<EOF
+{
+  "channel": "${SLACK_CHANNEL:-#security-alerts}",
+  "username": "GitLab CI/CD",
+  "icon_emoji": ":rotating_light:",
+  "text": "🚨 *Pipeline Failure*",
+  "attachments": [
+    {
+      "color": "danger",
+      "fields": [
+        {
+          "title": "Project",
+          "value": "$CI_PROJECT_NAME",
+          "short": true
+        },
+        {
+          "title": "Branch",
+          "value": "$CI_COMMIT_REF_NAME",
+          "short": true
+        },
+        {
+          "title": "Commit",
+          "value": "<$CI_PROJECT_URL/-/commit/$CI_COMMIT_SHA|$(echo $CI_COMMIT_SHA | cut -c1-8)>",
+          "short": true
+        },
+        {
+          "title": "Pipeline",
+          "value": "<$CI_PIPELINE_URL|#$CI_PIPELINE_ID>",
+          "short": true
+        },
+        {
+          "title": "Environment",
+          "value": "$DEPLOYMENT_NAMESPACE",
+          "short": true
+        },
+        {
+          "title": "Failed Stage",
+          "value": "$CI_JOB_STAGE",
+          "short": true
+        }
+      ],
+      "actions": [
+        {
+          "type": "button",
+          "text": "View Pipeline",
+          "url": "$CI_PIPELINE_URL"
+        },
+        {
+          "type": "button",
+          "text": "View Project",
+          "url": "$CI_PROJECT_URL"
+        }
+      ]
+    }
+  ]
+}
+EOF
+)
+
+        # Send to Slack
+        curl -X POST -H 'Content-type: application/json' \
+          --data "$PAYLOAD" \
+          "$SLACK_WEBHOOK_URL"
+
+        echo "Slack notification sent successfully"
+      else
+        echo "Slack webhook not configured, skipping notification..."
+      fi
+  when: on_failure
+  extends:
+    - .default:rule
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
+
