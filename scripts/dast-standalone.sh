@@ -26,7 +26,7 @@ readonly LOG_FILE="${WORK_DIR}/dast-$(date +%Y%m%d-%H%M%S).log"
 readonly REPORT_DIR="${DAST_REPORT_DIR:-${WORK_DIR}/reports}"
 
 # Docker & ZAP Configuration (reuse existing values)
-readonly ZAP_DOCKER_IMAGE="${ZAP_DOCKER_IMAGE:-owasp/zap2docker-stable}"
+readonly ZAP_DOCKER_IMAGE="${ZAP_DOCKER_IMAGE:-zaproxy/zap-stable:latest}"
 readonly ZAP_CONTAINER_NAME="dast-zap-$(date +%s)"
 readonly ZAP_API_KEY="${ZAP_API_KEY:-$(openssl rand -hex 16)}"
 readonly ZAP_HOST="${ZAP_HOST:-localhost}"
@@ -313,10 +313,9 @@ start_zap() {
     # Start ZAP with configuration from existing pipeline
     docker run -d \
         --name "$ZAP_CONTAINER_NAME" \
-        -p "${ZAP_HOST}:${ZAP_PORT}:8090" \
+        -p "${ZAP_PORT}:8090" \
         -v "${WORK_DIR}/zap:/zap/wrk" \
         -v "${REPORT_DIR}:/zap/report" \
-        -e "ZAP_API_KEY=$ZAP_API_KEY" \
         "$ZAP_DOCKER_IMAGE" \
         zap.sh \
         -daemon \
@@ -324,7 +323,7 @@ start_zap() {
         -port 8090 \
         -config api.addrs.addr.name=.* \
         -config api.addrs.addr.regex=true \
-        -config api.disablekey=false \
+        -config api.disablekey=true \
         >/dev/null 2>&1
 
     if ! wait_for_zap; then
