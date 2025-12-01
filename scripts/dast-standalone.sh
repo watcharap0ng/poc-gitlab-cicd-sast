@@ -26,7 +26,7 @@ readonly LOG_FILE="${WORK_DIR}/dast-$(date +%Y%m%d-%H%M%S).log"
 readonly REPORT_DIR="${DAST_REPORT_DIR:-${WORK_DIR}/reports}"
 
 # Docker & ZAP Configuration (reuse existing values)
-readonly ZAP_DOCKER_IMAGE="${ZAP_DOCKER_IMAGE:-owasp/zap2docker-stable}"
+readonly ZAP_DOCKER_IMAGE="${ZAP_DOCKER_IMAGE:-zaproxy/zap-stable:latest}"
 readonly ZAP_CONTAINER_NAME="dast-zap-$(date +%s)"
 readonly ZAP_API_KEY="${ZAP_API_KEY:-$(openssl rand -hex 16)}"
 readonly ZAP_HOST="${ZAP_HOST:-localhost}"
