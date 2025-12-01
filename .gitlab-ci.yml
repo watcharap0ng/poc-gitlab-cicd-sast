@@ -5,6 +5,7 @@ stages:
   - security_policy_check
   - public_report
   - deploy
+  - dast_testing
   - check-pods-status
 
 variables:
@@ -22,6 +23,14 @@ variables:
  FAIL_ON_MEDIUM: "${FAIL_ON_MEDIUM:-false}"
  SLACK_WEBHOOK_URL: "${SLACK_WEBHOOK_URL}"
  SLACK_CHANNEL: "${SLACK_CHANNEL:-#security-alerts}"
+
+# OWASP ZAP DAST Configuration
+ZAP_API_KEY: "${ZAP_API_KEY}"
+DAST_USERNAME: "${DAST_USERNAME}"
+DAST_PASSWORD: "${DAST_PASSWORD}"
+ZAP_SCAN_DEPTH: "${ZAP_SCAN_DEPTH:-5}"
+ZAP_THREADS: "${ZAP_THREADS:-5}"
+ZAP_EXCLUDE_URLS: "${ZAP_EXCLUDE_URLS:-.*\\.css$,.*\\.js$,.*\\.png$,.*\\.jpg$,.*\\.gif$,.*\\.svg$}"
 
 
 .default:rule:
@@ -367,7 +376,7 @@ upload_reports_defectdojo:
     - .default:rule
   tags:
     - docker
-  needs: ["clone_script_repo","🗝️gitleaks-secret-scan", "🐞semgrep-SAST-scan", "🛡️trivy-fs-scan", "🛡️trivy-docker-scan", "security_policy_check"]
+  needs: ["clone_script_repo","🗝️gitleaks-secret-scan", "🐞semgrep-SAST-scan", "🛡️trivy-fs-scan", "🛡️trivy-docker-scan", "🕷️dast-zap-baseline", "security_policy_check"]
   when: always
   before_script:
     - apk add --no-cache curl
@@ -391,6 +400,7 @@ upload_reports_defectdojo:
           semgrep_nodejs.json \
           trivy_fs_report.json \
           trivy_images_report.json \
+          gl-dast-report.json \
           dependency_track_findings.json \
           security_summary.json
 
@@ -654,6 +664,148 @@ check-pods-status:
     environment:
       name: $DEPLOYMENT_NAMESPACE
       url: $URL
+
+# ===========================================
+# OWASP ZAP DYNAMIC APPLICATION SECURITY TESTING (DAST)
+# ===========================================
+🕷️dast-zap-baseline:
+  stage: dast_testing
+  image: owasp/zap2docker-stable
+  extends:
+    - .default:rule
+  needs:
+    - job: deploy:to:k8s
+      artifacts: false
+    - job: check-pods-status
+      artifacts: false
+  tags:
+    - docker
+  variables:
+    # Target configuration
+    TARGET_URL: "$URL"
+    ZAP_API_KEY: "$ZAP_API_KEY"
+
+    # Scan configuration
+    ZAP_SCAN_DEPTH: "5"
+    ZAP_HOST_PER_SCAN: "1"
+    ZAP_THREADS: "5"
+
+    # Authentication (if needed)
+    ZAP_AUTH_URL: "$URL/login"
+    ZAP_AUTH_USERNAME: "$DAST_USERNAME"
+    ZAP_AUTH_PASSWORD: "$DAST_PASSWORD"
+    ZAP_AUTH_USERNAME_FIELD: "username"
+    ZAP_AUTH_PASSWORD_FIELD: "password"
+
+    # Exclusions and scope
+    ZAP_EXCLUDE_URLS: ".*\\.css$,.*\\.js$,.*\\.png$,.*\\.jpg$,.*\\.gif$,.*\\.svg$"
+    ZAP_ALLOWED_HOSTS: "$URL"
+
+    # Report configuration
+    ZAP_REPORT_FILE: "gl-dast-report.json"
+    ZAP_HTML_REPORT: "zap-dast-report.html"
+
+  before_script:
+    - echo "🕷️ Starting OWASP ZAP DAST scan..."
+    - echo "🎯 Target: $TARGET_URL"
+    - echo "🌍 Environment: $DEPLOYMENT_NAMESPACE"
+
+    # Wait for application to be ready
+    - |
+      echo "⏳ Waiting for application to be ready..."
+      for i in $(seq 1 30); do
+        if curl -f -s "$TARGET_URL" >/dev/null 2>&1; then
+          echo "✅ Application is ready for scanning"
+          break
+        fi
+        echo "Waiting... ($i/30)"
+        sleep 10
+        if [ $i -eq 30 ]; then
+          echo "⚠️ Application not ready after 5 minutes, proceeding anyway"
+        fi
+      done
+
+    # Setup ZAP directories
+    - mkdir -p /zap/wrk /zap/report
+
+  script:
+    - |
+      echo "🔍 Starting ZAP baseline scan..."
+
+      # Build ZAP command with options
+      ZAP_CMD="/zap/zap-baseline.py"
+      ZAP_CMD="$ZAP_CMD -t $TARGET_URL"
+      ZAP_CMD="$ZAP_CMD -J $ZAP_REPORT_FILE"
+      ZAP_CMD="$ZAP_CMD -r $ZAP_HTML_REPORT"
+      ZAP_CMD="$ZAP_CMD -d $ZAP_SCAN_DEPTH"
+      ZAP_CMD="$ZAP_CMD -T $ZAP_THREADS"
+
+      # Add authentication if configured
+      if [ -n "$ZAP_AUTH_USERNAME" ] && [ -n "$ZAP_AUTH_PASSWORD" ]; then
+        echo "🔐 Configuring authentication..."
+        ZAP_CMD="$ZAP_CMD -a $ZAP_AUTH_URL"
+        ZAP_CMD="$ZAP_CMD -U $ZAP_AUTH_USERNAME"
+        ZAP_CMD="$ZAP_CMD -P $ZAP_AUTH_PASSWORD"
+        ZAP_CMD="$ZAP_CMD -u $ZAP_AUTH_USERNAME_FIELD"
+        ZAP_CMD="$ZAP_CMD -p $ZAP_AUTH_PASSWORD_FIELD"
+      fi
+
+      # Add exclusions
+      if [ -n "$ZAP_EXCLUDE_URLS" ]; then
+        ZAP_CMD="$ZAP_CMD -x $ZAP_EXCLUDE_URLS"
+      fi
+
+      # Add API key if provided
+      if [ -n "$ZAP_API_KEY" ]; then
+        ZAP_CMD="$ZAP_CMD -z $ZAP_API_KEY"
+      fi
+
+      echo "🚀 Executing: $ZAP_CMD"
+
+      # Run ZAP scan
+      eval $ZAP_CMD || echo "ZAP scan completed with findings"
+
+      # Generate summary
+      if [ -f "$ZAP_REPORT_FILE" ]; then
+        echo "📊 ZAP scan completed successfully"
+        echo "📄 Report generated: $ZAP_REPORT_FILE"
+
+        # Count findings
+        FINDINGS_COUNT=$(cat $ZAP_REPORT_FILE | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    alerts = data.get('site', [{}])[0].get('alerts', [])
+    high_risk = len([a for a in alerts if a.get('risk') == 'High'])
+    medium_risk = len([a for a in alerts if a.get('risk') == 'Medium'])
+    low_risk = len([a for a in alerts if a.get('risk') == 'Low'])
+    total = len(alerts)
+    print(f'Total: {total}, High: {high_risk}, Medium: {medium_risk}, Low: {low_risk}')
+except:
+    print('Report parsing failed')
+")
+        echo "🎯 Scan Results: $FINDINGS_COUNT"
+      else
+        echo "⚠️ No ZAP report generated"
+      fi
+
+  artifacts:
+    when: always
+    reports:
+      dast: $ZAP_REPORT_FILE
+    paths:
+      - $ZAP_REPORT_FILE
+      - $ZAP_HTML_REPORT
+    expire_in: 1 week
+
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
+
+  allow_failure: true
+
+  # Optional: Add timeout to prevent hanging
+  timeout: 30m
 
 # ===========================================
 # SLACK FAILURE NOTIFICATIONS
