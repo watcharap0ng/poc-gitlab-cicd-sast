@@ -343,7 +343,7 @@ setup_zap_context() {
 
     # Create context
     local context_response
-    context_response=$(curl -s "${ZAP_API_URL}/JSON/context/newContext/" \
+    context_response=$(curl -s "${ZAP_API_URL}/JSON/context/action/newContext/" \
         -d "contextName=$context_name")
 
     local context_id
@@ -357,7 +357,7 @@ setup_zap_context() {
 
     # Include target URL in context
     local target_regex="${target_url//./\\.}.*"
-    curl -s "${ZAP_API_URL}/JSON/context/includeInContext/" \
+    curl -s "${ZAP_API_URL}/JSON/context/action/includeInContext/" \
         -d "contextName=$context_name" \
         -d "regex=$target_regex" \
         >/dev/null
@@ -365,7 +365,7 @@ setup_zap_context() {
     # Set technology stack if specified
     if [[ -n "${ZAP_TECHNOLOGY:-}" ]]; then
         log "DEBUG" "Setting technology stack: $ZAP_TECHNOLOGY"
-        curl -s "${ZAP_API_URL}/JSON/context/setContextTechnology/" \
+        curl -s "${ZAP_API_URL}/JSON/context/action/setContextTechnology/" \
             -d "contextName=$context_name" \
             -d "technology=$ZAP_TECHNOLOGY" \
             >/dev/null
@@ -539,13 +539,12 @@ run_spider() {
 
     # Start spider
     local spider_response
-    spider_response=$(curl -s "${ZAP_API_URL}/JSON/spider/scan/" \
-        -d "contextId=$context_id" \
+    spider_response=$(curl -s "${ZAP_API_URL}/JSON/spider/action/scan/" \
+        -d "url=$target_url" \
         -d "maxChildren=$spider_max_children" \
         -d "maxDepth=$spider_max_depth" \
         -d "acceptCookies=$spider_accept_cookies" \
-        -d "handleODataParameters=$spider_handle_params" \
-        -d "url=$target_url")
+        -d "handleODataParameters=$spider_handle_params")
 
     local scan_id
     scan_id=$(echo "$spider_response" | \
@@ -564,7 +563,7 @@ run_spider() {
 
     while [[ $wait_time -lt $max_wait ]]; do
         local status_response
-        status_response=$(curl -s "${ZAP_API_URL}/JSON/spider/status/" \
+        status_response=$(curl -s "${ZAP_API_URL}/JSON/spider/view/status/" \
             -d "scanId=$scan_id")
 
         local progress
@@ -625,7 +624,7 @@ run_ajax_spider() {
 
     while [[ $wait_time -lt $max_wait ]]; do
         local status_response
-        status_response=$(curl -s "${ZAP_API_URL}/JSON/ajaxSpider/status/")
+        status_response=$(curl -s "${ZAP_API_URL}/JSON/ajaxSpider/view/status/")
 
         local status
         status=$(echo "$status_response" | \
@@ -687,7 +686,7 @@ run_active_scan() {
 
     while [[ $wait_time -lt $max_wait ]]; do
         local status_response
-        status_response=$(curl -s "${ZAP_API_URL}/JSON/ascan/status/" \
+        status_response=$(curl -s "${ZAP_API_URL}/JSON/ascan/view/status/" \
             -d "scanId=$scan_id")
 
         local progress
