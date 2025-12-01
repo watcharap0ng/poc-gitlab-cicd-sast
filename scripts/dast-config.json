@@ -1,0 +1,66 @@
+{
+  "description": "DAST Standalone Scanner Configuration Template",
+  "version": "1.0.0",
+
+  "scan_configuration": {
+    "scan_depth": 5,
+    "threads": 5,
+    "max_duration": 36000,
+    "delay_ms": 0,
+    "ajax_spider": true,
+    "ajax_spider_max_duration": 36000,
+    "browser_id": "chrome-headless"
+  },
+
+  "authentication": {
+    "method": "none",
+    "username": "",
+    "password": "",
+    "token": "",
+    "cookies": "",
+    "auth_url": "",
+    "login_field": "username",
+    "password_field": "password",
+    "verify_url": "",
+    "logout_url": ""
+  },
+
+  "exclusions": {
+    "exclude_urls": ".*\\.css$,.*\\.js$,.*\\.png$,.*\\.jpg$,.*\\.gif$,.*\\.svg$",
+    "exclude_params": "session.*,csrf.*,auth.*,token.*,password.*,confirm.*",
+    "exclude_headers": "X-Debug,X-Requested-With",
+    "exclude_cookies": "session.*,csrf.*,auth.*,token.*",
+    "exclude_status_codes": "404,500,502,503"
+  },
+
+  "zap_configuration": {
+    "context_name": "dast-scan-context",
+    "technology": "NodeJS,React,JavaScript,HTML5",
+    "allowed_hosts": "",
+    "authentication_strategy": "detect"
+  },
+
+  "defectdojo": {
+    "url": "",
+    "token": "",
+    "project_name": "",
+    "engagement_name": "",
+    "auto_create": true,
+    "upload_findings": true
+  },
+
+  "policy": {
+    "fail_on_high_critical": true,
+    "fail_on_medium": false,
+    "max_high_vulnerabilities": 0,
+    "max_medium_vulnerabilities": 10
+  },
+
+  "output": {
+    "report_dir": "./dast-reports",
+    "report_name": "dast-report",
+    "generate_html": true,
+    "generate_markdown": true,
+    "verbose": true
+  }
+}
