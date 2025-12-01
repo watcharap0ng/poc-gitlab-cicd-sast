@@ -479,14 +479,18 @@ Closes #[issue-number]
 -   **Creating overly comprehensive initial plans** - Break complex projects into 1-hour phases instead
 -   **Trying to implement everything at once** - Start with minimum viable implementation, test, then expand
 -   **Skipping AI Diary and Honest Feedback in retrospectives** - These sections provide crucial context and self-reflection that technical documentation alone cannot capture
+-   **Attempting manual fixes on systematically corrupted files** - When >20% of file has duplication/syntax errors, use git restore instead
 -   *Example: Forgetting to update a lockfile after changing dependencies.*
 -   *Example: Not checking build logs for warnings that could become errors.*
 -   *Example: Making assumptions about API responses instead of checking the spec.*
+-   *Example: Spending hours fixing duplicate lines manually instead of using git restore.*
 
 ### Useful Tricks Discovered
 -   **Parallel agents for analysis** - Using multiple agents to analyze different aspects speeds up planning significantly
 -   **ccc → nnn workflow** - Context capture followed by focused planning creates better structured issues
 -   **Phase markers in issues** - Using "Phase 1:", "Phase 2:" helps track incremental progress
+-   **Early syntax validation** - Always run `bash -n` on shell scripts early to identify scope of issues
+-   **Git restore as debugging tool** - Use `git checkout HEAD -- file` when systematic corruption is detected
 -   *Example: Using a specific library feature to simplify complex state.*
 -   *Example: A shell command alias that speeds up a common task.*
 -   *Example: A design pattern that solved a recurring problem in the codebase.*
