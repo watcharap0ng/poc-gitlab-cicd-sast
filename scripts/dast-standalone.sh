@@ -357,10 +357,10 @@ setup_zap_context() {
     fi
 
     # Include target URL in context
-    local target_regex="${target_url//./}"
+    local target_regex="${target_url//./\\.}.*"
     curl -s "${ZAP_API_URL}/JSON/context/action/includeInContext/" \
         -d "contextName=$context_name" \
-        -d "regex=${target_regex}" \
+        -d "regex=$target_regex" \
         >/dev/null
 
     # Set technology stack if specified
