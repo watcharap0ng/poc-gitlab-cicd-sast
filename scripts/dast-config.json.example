@@ -5,10 +5,10 @@
   "scan_configuration": {
     "scan_depth": 5,
     "threads": 5,
-    "max_duration": 1800,
+    "max_duration": 36000,
     "delay_ms": 0,
     "ajax_spider": true,
-    "ajax_spider_max_duration": 1800,
+    "ajax_spider_max_duration": 36000,
     "browser_id": "chrome-headless"
   },
 
