@@ -401,6 +401,7 @@ upload_reports_defectdojo:
           trivy_fs_report.json \
           trivy_images_report.json \
           gl-dast-report.json \
+          gl-dast-report.xml \
           dependency_track_findings.json \
           security_summary.json
 
@@ -734,6 +735,7 @@ check-pods-status:
 
     # Report configuration
     ZAP_REPORT_FILE: "gl-dast-report.json"
+    ZAP_XML_REPORT: "gl-dast-report.xml"
     ZAP_HTML_REPORT: "zap-dast-report.html"
 
   before_script:
@@ -767,6 +769,7 @@ check-pods-status:
       ZAP_CMD="/zap/zap-baseline.py"
       ZAP_CMD="$ZAP_CMD -t $TARGET_URL"
       ZAP_CMD="$ZAP_CMD -J $ZAP_REPORT_FILE"
+      ZAP_CMD="$ZAP_CMD -x $ZAP_XML_REPORT"
       ZAP_CMD="$ZAP_CMD -r $ZAP_HTML_REPORT"
       ZAP_CMD="$ZAP_CMD -d $ZAP_SCAN_DEPTH"
       ZAP_CMD="$ZAP_CMD -T $ZAP_THREADS"
@@ -1096,6 +1099,7 @@ EOF
       dast: $ZAP_REPORT_FILE
     paths:
       - $ZAP_REPORT_FILE
+      - $ZAP_XML_REPORT
       - $ZAP_HTML_REPORT
       - zap_scan_metrics.json
     expire_in: 1 week

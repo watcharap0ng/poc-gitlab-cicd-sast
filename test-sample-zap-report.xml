@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OWASPZAPReport version="2.12" generated="2025-01-02T12:00:00">
+  <site name="https://example-nodejs-app.com" host="example-nodejs-app.com" port="443" ssl="true">
+    <alerts>
+      <alertitem>
+        <pluginid>40018</pluginid>
+        <alert>Content Security Policy Header Not Set</alert>
+        <riskcode>2</riskcode>
+        <confidence>3</confidence>
+        <desc>The site does not implement the HTTP Content-Security-Policy header.</desc>
+        <solution>Ensure that your web server, application server, or load balancer is configured to set the Content-Security-Policy header.</solution>
+        <reference>https://owasp.org/www-project-owasp-top-ten/2021/A05_security_misconfiguration.html</reference>
+        <cweid>693</cweid>
+        <wascid>13</wascid>
+        <instances>
+          <instance>
+            <uri>https://example-nodejs-app.com/</uri>
+            <method>GET</method>
+            <param>response-header</param>
+            <attack>NO_CSP_HEADER_TEST</attack>
+            <evidence>Content-Security-Policy header not present in response</evidence>
+          </instance>
+        </instances>
+      </alertitem>
+    </alerts>
+  </site>
+</OWASPZAPReport>

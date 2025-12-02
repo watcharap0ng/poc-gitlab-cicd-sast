@@ -97,6 +97,7 @@ class DefectDojoUploader:
             'trivy_fs_report.json': 'Trivy Scan',
             'trivy_images_report.json': 'Trivy Scan',
             'gl-dast-report.json': 'OWASP ZAP DAST Scan',
+            'gl-dast-report.xml': 'OWASP ZAP DAST Scan (XML)',
             'dependency_track_findings.json': 'Dependency-Track Scan',
             'syft.cdx.json': 'Software Bill of Materials (SBOM)',
             'njsscan.sarif': 'SARIF',

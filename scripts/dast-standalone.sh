@@ -762,6 +762,7 @@ apply_exclusions() {
 generate_reports() {
     local report_name="${REPORT_NAME:-dast-report}"
     local json_report="${REPORT_DIR}/${report_name}.json"
+    local xml_report="${REPORT_DIR}/${report_name}.xml"
     local html_report="${REPORT_DIR}/${report_name}.html"
     local md_report="${REPORT_DIR}/${report_name}.md"
 
@@ -773,6 +774,17 @@ generate_reports() {
         -o "$json_report"; then
         log "ERROR" "Failed to generate JSON report"
         return 1
+    fi
+
+    # Generate XML report
+    if [[ "${GENERATE_XML:-false}" == "true" ]]; then
+        log "INFO" "Generating XML report: $xml_report"
+        if ! curl -s "${ZAP_API_URL}/JSON/core/view/xmlreport/" \
+            -o "$xml_report"; then
+            log "ERROR" "Failed to generate XML report"
+            return 1
+        fi
+        log "SUCCESS" "XML report generated: $xml_report"
     fi
 
     # Generate HTML report
@@ -1302,6 +1314,7 @@ OUTPUT OPTIONS:
     -r, --report-name NAME      Base name for reports (default: dast-report)
     --no-html                   Disable HTML report generation
     --no-markdown              Disable Markdown report generation
+    --xml                       Generate XML report for DefectDojo upload
 
 DEFECTDOJO OPTIONS:
     --defectdojo-url URL        DefectDojo instance URL
@@ -1463,6 +1476,10 @@ main() {
                 ;;
             --no-markdown)
                 export GENERATE_MARKDOWN="false"
+                shift
+                ;;
+            --xml)
+                export GENERATE_XML="true"
                 shift
                 ;;
             --defectdojo-url)
