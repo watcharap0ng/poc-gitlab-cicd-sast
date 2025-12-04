@@ -5,8 +5,9 @@ stages:
   - security_policy_check
   - public_report
   - deploy
-  - dast_testing
+  - e2e_testing
   - check-pods-status
+  - dast_testing
 
 variables:
  URL_DOMAIN_DEFECTDOJO: $URL_DOMAIN_DEFECTDOJO
@@ -31,6 +32,17 @@ DAST_PASSWORD: "${DAST_PASSWORD}"
 ZAP_SCAN_DEPTH: "${ZAP_SCAN_DEPTH:-5}"
 ZAP_THREADS: "${ZAP_THREADS:-5}"
 ZAP_EXCLUDE_URLS: "${ZAP_EXCLUDE_URLS:-.*\\.css$,.*\\.js$,.*\\.png$,.*\\.jpg$,.*\\.gif$,.*\\.svg$}"
+
+# E2E Testing Configuration
+E2E_BASE_URL: "${E2E_BASE_URL:-$URL}"
+E2E_TIMEOUT: "${E2E_TIMEOUT:-30000}"
+E2E_BROWSER: "${E2E_BROWSER:-all}"
+E2E_PARALLEL_JOBS: "${E2E_PARALLEL_JOBS:-3}"
+E2E_RETRY_COUNT: "${E2E_RETRY_COUNT:-2}"
+OAUTH_TEST_TOKEN: "${OAUTH_TEST_TOKEN}"
+TEST_USER_USERNAME: "${TEST_USER_USERNAME}"
+TEST_USER_PASSWORD: "${TEST_USER_PASSWORD}"
+TEST_DATABASE_URL: "${TEST_DATABASE_URL}"
 
 
 .default:rule:
@@ -647,6 +659,216 @@ deploy:to:k8s:
     name: $DEPLOYMENT_NAMESPACE
     url: $URL
 
+# ===========================================
+# END-TO-END (E2E) TESTING WITH PLAYWRIGHT
+# ===========================================
+🧪e2e-testing:
+  stage: e2e_testing
+  image: mcr.microsoft.com/playwright:v1.40.0
+  extends:
+    - .default:rule
+  needs:
+    - job: deploy:to:k8s
+      artifacts: false
+  tags:
+    - docker
+  variables:
+    # Test environment configuration
+    E2E_BASE_URL: "$URL"
+    E2E_TIMEOUT: "30000"
+    E2E_BROWSER: "all"
+
+    # Authentication configuration
+    OAUTH_TEST_TOKEN: "$OAUTH_TEST_TOKEN"
+    TEST_USER_USERNAME: "$TEST_USER_USERNAME"
+    TEST_USER_PASSWORD: "$TEST_USER_PASSWORD"
+
+    # Test data configuration
+    TEST_DATABASE_URL: "$TEST_DATABASE_URL"
+    TEST_ENVIRONMENT: "$DEPLOYMENT_NAMESPACE"
+
+    # CI/CD specific configuration
+    CI: "true"
+    NODE_ENV: "test"
+
+    # Parallel execution configuration
+    CI_NODE_INDEX: "$CI_NODE_INDEX"
+    CI_NODE_TOTAL: "$CI_NODE_TOTAL"
+
+  before_script:
+    - echo "🧪 Starting E2E Testing Setup..."
+    - echo "🌐 Target URL: $E2E_BASE_URL"
+    - echo "🏷️ Environment: $DEPLOYMENT_NAMESPACE"
+    - echo "📱 Browser: $E2E_BROWSER"
+
+    # Navigate to E2E directory
+    - cd e2e
+
+    # Install dependencies
+    - echo "📦 Installing E2E testing dependencies..."
+    - npm ci --cache .npm --prefer-offline
+
+    # Install Playwright browsers
+    - echo "🌍 Installing Playwright browsers..."
+    - npx playwright install --with-deps
+
+    # Wait for application to be ready
+    - |
+      echo "⏳ Waiting for application to be ready..."
+      for i in $(seq 1 30); do
+        if curl -f -s "$E2E_BASE_URL" >/dev/null 2>&1; then
+          echo "✅ Application is ready for E2E testing"
+          break
+        fi
+        echo "Waiting... ($i/30)"
+        sleep 10
+        if [ $i -eq 30 ]; then
+          echo "⚠️ Application not ready after 5 minutes, proceeding anyway"
+        fi
+      done
+
+    # Setup test data if scripts exist
+    - |
+      if [ -f "scripts/setup-test-data.sh" ]; then
+        echo "🔧 Setting up test data..."
+        chmod +x scripts/setup-test-data.sh
+        ./scripts/setup-test-data.sh
+      else
+        echo "ℹ️  No test data setup script found"
+      fi
+
+  script:
+    - |
+      echo "🚀 Running E2E tests..."
+
+      # Determine test execution strategy based on parallel job
+      case "$CI_NODE_INDEX" in
+        1|"" )
+          echo "🌐 Running Chromium (Chrome) tests..."
+          export GREP_CHROMIUM=".*"
+          export GREP_FIREFOX=""
+          export GREP_WEBKIT=""
+          ;;
+        2 )
+          echo "🦊 Running Firefox tests..."
+          export GREP_CHROMIUM=""
+          export GREP_FIREFOX=".*"
+          export GREP_WEBKIT=""
+          ;;
+        3 )
+          echo "🧭 Running Safari (WebKit) tests..."
+          export GREP_CHROMIUM=""
+          export GREP_FIREFOX=""
+          export GREP_WEBKIT=".*"
+          ;;
+      esac
+
+      # Run E2E tests with comprehensive reporting
+      npm run test:e2e:ci
+
+      # Generate test summary
+      if [ -f "test-results/results.json" ]; then
+        echo "📊 Generating test summary..."
+
+        # Extract test statistics
+        TOTAL_TESTS=$(cat test-results/results.json | node -e "
+          const data = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+          const total = data.suites?.[0]?.specs?.[0]?.tests?.length || 0;
+          console.log(total);
+        ")
+
+        PASSED_TESTS=$(cat test-results/results.json | node -e "
+          const data = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+          const passed = data.suites?.[0]?.specs?.[0]?.tests?.filter(t => t.results?.[0]?.status === 'passed')?.length || 0;
+          console.log(passed);
+        ")
+
+        FAILED_TESTS=$(cat test-results/results.json | node -e "
+          const data = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+          const failed = data.suites?.[0]?.specs?.[0]?.tests?.filter(t => t.results?.[0]?.status === 'failed')?.length || 0;
+          console.log(failed);
+        ")
+
+        echo "🎯 E2E Test Results Summary:"
+        echo "   Total Tests: $TOTAL_TESTS"
+        echo "   ✅ Passed: $PASSED_TESTS"
+        echo "   ❌ Failed: $FAILED_TESTS"
+
+        # Generate detailed metrics
+        cat > e2e-test-metrics.json << EOF
+        {
+          "test_summary": {
+            "total_tests": $TOTAL_TESTS,
+            "passed_tests": $PASSED_TESTS,
+            "failed_tests": $FAILED_TESTS,
+            "pass_rate": $(( PASSED_TESTS * 100 / (TOTAL_TESTS + 1) ))
+          },
+          "test_environment": {
+            "base_url": "$E2E_BASE_URL",
+            "environment": "$DEPLOYMENT_NAMESPACE",
+            "browser": "$E2E_BROWSER",
+            "parallel_job": "$CI_NODE_INDEX",
+            "timestamp": "$(date -Iseconds)"
+          }
+        }
+        EOF
+
+        # Check for test failures
+        if [ "$FAILED_TESTS" -gt 0 ]; then
+          echo "❌ E2E tests failed - Check artifacts for details"
+          exit 1
+        else
+          echo "✅ All E2E tests passed successfully!"
+        fi
+      else
+        echo "⚠️ No test results found - Tests may have failed to run"
+        exit 1
+      fi
+
+  after_script:
+    - |
+      echo "🧹 Running E2E cleanup..."
+
+      # Cleanup test data if scripts exist
+      if [ -f "scripts/cleanup-test-data.sh" ]; then
+        echo "🗑️ Cleaning up test data..."
+        chmod +x scripts/cleanup-test-data.sh
+        ./scripts/cleanup-test-data.sh
+      fi
+
+      # Generate comprehensive test report
+      if [ -f "test-results/results.json" ]; then
+        echo "📋 Generating comprehensive test report..."
+
+        # List generated artifacts
+        echo "📁 Generated E2E Artifacts:"
+        if [ -d "test-results" ]; then
+          find test-results -type f -name "*.png" -o -name "*.webm" -o -name "*.zip" -o -name "*.json" -o -name "*.xml" | head -10 | sed 's/^/   • /'
+        fi
+      fi
+
+  artifacts:
+    when: always
+    reports:
+      junit: e2e/test-results/junit.xml
+    paths:
+      - e2e/test-results/
+      - e2e/playwright-report/
+      - e2e/e2e-test-metrics.json
+    expire_in: 1 week
+    name: "e2e-test-results-$CI_COMMIT_SHORT_SHA"
+
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
+
+  timeout: 15m
+
+  parallel: $E2E_PARALLEL_JOBS
+
+  # Allow failure initially, can be removed once stable
+  allow_failure: true
+
 check-pods-status:
     stage: check-pods-status
     extends:
@@ -654,6 +876,7 @@ check-pods-status:
      - .kube-context
     needs:
      - deploy:to:k8s
+     - 🧪e2e-testing
     image:
       name: poc-project.com/poc-project/custom-kubectl:latest
       entrypoint: [""]
@@ -676,6 +899,8 @@ check-pods-status:
     - .default:rule
   needs:
     - job: deploy:to:k8s
+      artifacts: false
+    - job: 🧪e2e-testing
       artifacts: false
     - job: check-pods-status
       artifacts: false
