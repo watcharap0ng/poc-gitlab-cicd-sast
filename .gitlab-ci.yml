@@ -4,10 +4,13 @@ stages:
   - scan_security
   - security_policy_check
   - public_report
-  - deploy
-  - e2e_testing
-  - check-pods-status
-  - dast_testing
+  - deploy_dev
+  - deploy_demo
+  - approve_production
+  - deploy_prod
+  - e2e_testing_dev
+  - check_pods_status
+  - dast_testing_dev
 
 variables:
  URL_DOMAIN_DEFECTDOJO: $URL_DOMAIN_DEFECTDOJO
@@ -45,18 +48,22 @@ TEST_USER_PASSWORD: "${TEST_USER_PASSWORD}"
 TEST_DATABASE_URL: "${TEST_DATABASE_URL}"
 
 
-.default:rule:
+.dev:rule:
   rules:
-   - if: $CI_COMMIT_BRANCH == "deploy_prod"
+   - if: $CI_COMMIT_BRANCH == "main"
      variables:
        KUBE_CONTEXT: poc-project:poc-project-agent
-       DEPLOYMENT_NAMESPACE: poc-project-prod
-       DEPLOY_MANIFEST_PATH: outsource/poc-project/yaml-poc-projectphp-deploy-prod
-       DEPLOY_MANIFEST: yaml-poc-projectphp-deploy-prod
-       DEPLOY_YAML: yaml-poc-projectphp-deploy-prod/yaml/
-       DEPLOY_ENV: yaml-poc-projectphp-deploy-prod/env/       
+       DEPLOYMENT_NAMESPACE: poc-project-dev
+       DEPLOY_MANIFEST_PATH: outsource/poc-project/yaml-poc-projectphp-deploy-dev
+       DEPLOY_MANIFEST: yaml-poc-projectphp-deploy-dev
+       DEPLOY_YAML: yaml-poc-projectphp-deploy-dev/yaml/
+       DEPLOY_ENV: yaml-poc-projectphp-deploy-dev/env/
        SECRET_NAME: poc-project-secret-env
-       URL: https://poc-project.com/poc-project
+       URL: https://poc-project.dev.com
+       ENVIRONMENT_TYPE: "development"
+
+.demo:rule:
+  rules:
    - if:  $CI_COMMIT_BRANCH == "deploy_demo"
      variables:
        KUBE_CONTEXT: poc-project:poc-project-agent
@@ -65,8 +72,23 @@ TEST_DATABASE_URL: "${TEST_DATABASE_URL}"
        DEPLOY_MANIFEST: yaml-poc-projectphp-deploy-demo
        DEPLOY_YAML: yaml-poc-projectphp-deploy-demo/yaml/
        DEPLOY_ENV: yaml-poc-projectphp-deploy-demo/env/
-       SECRET_NAME: poc-project-secret-env       
+       SECRET_NAME: poc-project-secret-env
        URL: https://poc-project.demo.com
+       ENVIRONMENT_TYPE: "demo"
+
+.prod:rule:
+  rules:
+   - if: $CI_COMMIT_BRANCH == "deploy_prod"
+     variables:
+       KUBE_CONTEXT: poc-project:poc-project-agent
+       DEPLOYMENT_NAMESPACE: poc-project-prod
+       DEPLOY_MANIFEST_PATH: outsource/poc-project/yaml-poc-projectphp-deploy-prod
+       DEPLOY_MANIFEST: yaml-poc-projectphp-deploy-prod
+       DEPLOY_YAML: yaml-poc-projectphp-deploy-prod/yaml/
+       DEPLOY_ENV: yaml-poc-projectphp-deploy-prod/env/
+       SECRET_NAME: poc-project-secret-env
+       URL: https://poc-project.com/poc-project
+       ENVIRONMENT_TYPE: "production"
 
 
 .kube-context:
@@ -381,14 +403,32 @@ build:image:
     url: $URL
 
 
-upload_reports_defectdojo:
+upload_reports_defectdojo:dev:
   stage: public_report
   image: python:3.11-alpine
   extends:
-    - .default:rule
+    - .dev:rule
   tags:
     - docker
-  needs: ["clone_script_repo","🗝️gitleaks-secret-scan", "🐞semgrep-SAST-scan", "🛡️trivy-fs-scan", "🛡️trivy-docker-scan", "🕷️dast-zap-baseline", "security_policy_check"]
+  needs: ["clone_script_repo","🗝️gitleaks-secret-scan", "🐞semgrep-SAST-scan", "🛡️trivy-fs-scan", "🛡️trivy-docker-scan", "🕷️dast-zap-baseline-dev", "security_policy_check"]
+
+upload_reports_defectdojo:demo:
+  stage: public_report
+  image: python:3.11-alpine
+  extends:
+    - .demo:rule
+  tags:
+    - docker
+  needs: ["clone_script_repo","🗝️gitleaks-secret-scan", "🐞semgrep-SAST-scan", "🛡️trivy-fs-scan", "🛡️trivy-docker-scan", "security_policy_check"]
+
+upload_reports_defectdojo:prod:
+  stage: public_report
+  image: python:3.11-alpine
+  extends:
+    - .prod:rule
+  tags:
+    - docker
+  needs: ["clone_script_repo","🗝️gitleaks-secret-scan", "🐞semgrep-SAST-scan", "🛡️trivy-fs-scan", "🛡️trivy-docker-scan", "security_policy_check"]
   when: always
   before_script:
     - apk add --no-cache curl
@@ -608,38 +648,43 @@ except:
     url: $URL
 
 
-clone:manifest:
-   stage: deploy
+# ===========================================
+# DEVELOPMENT ENVIRONMENT DEPLOYMENT
+# ===========================================
+clone:manifest:dev:
+   stage: deploy_dev
    tags:
       - docker
-   image: 
+   image:
      name: alpine/git:latest
      entrypoint: [""]
-   extends: 
-    - .default:rule
+   extends:
+    - .dev:rule
    script:
      - git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@poc-project.com/$DEPLOY_MANIFEST_PATH.git
    artifacts:
      paths:
        - $DEPLOY_MANIFEST
      expire_in: 1h
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
 
-# Deploy application on K8s cluster using kubectl
-deploy:to:k8s:
-  stage: deploy
+deploy:to:dev:
+  stage: deploy_dev
   extends:
-    - .default:rule
+    - .dev:rule
     - .kube-context
   needs:
-    - clone:manifest
+    - clone:manifest:dev
   image:
     name: poc-project.com/poc-project/custom-kubectl:latest
     entrypoint: [""]
   tags:
      - docker
   script:
-  # Read variable create secret.yaml and deploy on k8s
     - |
+        echo "🚀 Deploying to Development Environment"
         lines=$(base64 $DEPLOY_ENV/.env | tr -d \\n)
         cat <<EOF | kubectl apply -f -
         apiVersion: v1
@@ -653,22 +698,181 @@ deploy:to:k8s:
 
     - ls
     - export IMAGE_TAG=${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}
-    - kubectl apply -f  $DEPLOY_YAML --namespace=$DEPLOYMENT_NAMESPACE # Directory where yamls are placed in repo
+    - kubectl apply -f  $DEPLOY_YAML --namespace=$DEPLOYMENT_NAMESPACE
     - kubectl --namespace=$DEPLOYMENT_NAMESPACE set image deployment/poc-project-deployment poc-project-app=poc-project.com/poc-project-php:$IMAGE_TAG
+    - echo "✅ Development deployment completed"
   environment:
     name: $DEPLOYMENT_NAMESPACE
     url: $URL
 
 # ===========================================
+# DEMO ENVIRONMENT DEPLOYMENT
+# ===========================================
+clone:manifest:demo:
+   stage: deploy_demo
+   tags:
+      - docker
+   image:
+     name: alpine/git:latest
+     entrypoint: [""]
+   extends:
+    - .demo:rule
+   script:
+     - git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@poc-project.com/$DEPLOY_MANIFEST_PATH.git
+   artifacts:
+     paths:
+       - $DEPLOY_MANIFEST
+     expire_in: 1h
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
+
+deploy:to:demo:
+  stage: deploy_demo
+  extends:
+    - .demo:rule
+    - .kube-context
+  needs:
+    - clone:manifest:demo
+  image:
+    name: poc-project.com/poc-project/custom-kubectl:latest
+    entrypoint: [""]
+  tags:
+     - docker
+  script:
+    - |
+        echo "🚀 Deploying to Demo Environment"
+        lines=$(base64 $DEPLOY_ENV/.env | tr -d \\n)
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        data:
+            .env: $lines
+        kind: Secret
+        metadata:
+            name: $SECRET_NAME
+            namespace: $DEPLOYMENT_NAMESPACE
+        EOF
+
+    - ls
+    - export IMAGE_TAG=${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}
+    - kubectl apply -f  $DEPLOY_YAML --namespace=$DEPLOYMENT_NAMESPACE
+    - kubectl --namespace=$DEPLOYMENT_NAMESPACE set image deployment/poc-project-deployment poc-project-app=poc-project.com/poc-project-php:$IMAGE_TAG
+    - echo "✅ Demo deployment completed"
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
+
+# ===========================================
+# PRODUCTION APPROVAL WORKFLOW
+# ===========================================
+approve_production_deploy:
+  stage: approve_production
+  extends:
+    - .prod:rule
+  script:
+    - |
+        echo "🚨 Production deployment approval required"
+        echo "Environment: $DEPLOYMENT_NAMESPACE"
+        echo "Target URL: $URL"
+        echo "Commit: $CI_COMMIT_SHORT_SHA"
+        echo "Approver must be a member of the 'devops' group"
+  when: manual
+  allow_failure: false
+  only:
+    - deploy_prod
+  environment:
+    name: production-approval
+    url: https://poc-project.com/poc-project
+    action: start
+
+# ===========================================
+# PRODUCTION ENVIRONMENT DEPLOYMENT
+# ===========================================
+clone:manifest:prod:
+   stage: deploy_prod
+   tags:
+      - docker
+   image:
+     name: alpine/git:latest
+     entrypoint: [""]
+   extends:
+    - .prod:rule
+   script:
+     - git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@poc-project.com/$DEPLOY_MANIFEST_PATH.git
+   artifacts:
+     paths:
+       - $DEPLOY_MANIFEST
+     expire_in: 1h
+  needs:
+    - job: approve_production_deploy
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
+
+deploy:to:prod:
+  stage: deploy_prod
+  extends:
+    - .prod:rule
+    - .kube-context
+  needs:
+    - clone:manifest:prod
+  image:
+    name: poc-project.com/poc-project/custom-kubectl:latest
+    entrypoint: [""]
+  tags:
+     - docker
+  script:
+    - |
+        echo "🚀 Deploying to Production Environment (APPROVED)"
+        echo "Environment: $DEPLOYMENT_NAMESPACE"
+        echo "Target URL: $URL"
+        lines=$(base64 $DEPLOY_ENV/.env | tr -d \\n)
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        data:
+            .env: $lines
+        kind: Secret
+        metadata:
+            name: $SECRET_NAME
+            namespace: $DEPLOYMENT_NAMESPACE
+        EOF
+
+    - ls
+    - export IMAGE_TAG=${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}
+    - kubectl apply -f  $DEPLOY_YAML --namespace=$DEPLOYMENT_NAMESPACE
+    - kubectl --namespace=$DEPLOYMENT_NAMESPACE set image deployment/poc-project-deployment poc-project-app=poc-project.com/poc-project-php:$IMAGE_TAG
+    - echo "✅ Production deployment completed successfully"
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    url: $URL
+    on_stop: stop_production
+
+stop_production:
+  stage: .post
+  extends:
+    - .prod:rule
+    - .kube-context
+  script:
+    - |
+        echo "🛑 Stopping Production Environment (Manual Stop Triggered)"
+        echo "This will scale down the production deployment to 0 replicas"
+        kubectl scale deployment/poc-project-deployment --replicas=0 -n $DEPLOYMENT_NAMESPACE
+        echo "✅ Production deployment stopped"
+  when: manual
+  environment:
+    name: $DEPLOYMENT_NAMESPACE
+    action: stop
+
+# ===========================================
 # END-TO-END (E2E) TESTING WITH PLAYWRIGHT
 # ===========================================
-🧪e2e-testing:
-  stage: e2e_testing
+🧪e2e-testing-dev:
+  stage: e2e_testing_dev
   image: mcr.microsoft.com/playwright:v1.40.0
   extends:
-    - .default:rule
+    - .dev:rule
   needs:
-    - job: deploy:to:k8s
+    - job: deploy:to:dev
       artifacts: false
   tags:
     - docker
@@ -869,22 +1073,69 @@ deploy:to:k8s:
   # Allow failure initially, can be removed once stable
   allow_failure: true
 
-check-pods-status:
-    stage: check-pods-status
+# ===========================================
+# POD STATUS CHECKING (ENVIRONMENT-SPECIFIC)
+# ===========================================
+check-pods-status:dev:
+    stage: check_pods_status
     extends:
-     - .default:rule
+     - .dev:rule
      - .kube-context
     needs:
-     - deploy:to:k8s
-     - 🧪e2e-testing
+     - deploy:to:dev
+     - 🧪e2e-testing-dev
     image:
       name: poc-project.com/poc-project/custom-kubectl:latest
       entrypoint: [""]
     script:
-      # Check Status Pod
-      - sleep 60
-      - labels=$(kubectl describe deployment/poc-project-deployment -n $DEPLOYMENT_NAMESPACE | grep Labels | grep appName | awk '{print $2}')
-      - kubectl get pods -l "$labels" -n $DEPLOYMENT_NAMESPACE
+      - |
+        echo "🔍 Checking pod status in Development Environment"
+        sleep 60
+        labels=$(kubectl describe deployment/poc-project-deployment -n $DEPLOYMENT_NAMESPACE | grep Labels | grep appName | awk '{print $2}')
+        kubectl get pods -l "$labels" -n $DEPLOYMENT_NAMESPACE
+        echo "✅ Development pod status check completed"
+    environment:
+      name: $DEPLOYMENT_NAMESPACE
+      url: $URL
+
+check-pods-status:demo:
+    stage: check_pods_status
+    extends:
+     - .demo:rule
+     - .kube-context
+    needs:
+     - deploy:to:demo
+    image:
+      name: poc-project.com/poc-project/custom-kubectl:latest
+      entrypoint: [""]
+    script:
+      - |
+        echo "🔍 Checking pod status in Demo Environment"
+        sleep 60
+        labels=$(kubectl describe deployment/poc-project-deployment -n $DEPLOYMENT_NAMESPACE | grep Labels | grep appName | awk '{print $2}')
+        kubectl get pods -l "$labels" -n $DEPLOYMENT_NAMESPACE
+        echo "✅ Demo pod status check completed"
+    environment:
+      name: $DEPLOYMENT_NAMESPACE
+      url: $URL
+
+check-pods-status:prod:
+    stage: check_pods_status
+    extends:
+     - .prod:rule
+     - .kube-context
+    needs:
+     - deploy:to:prod
+    image:
+      name: poc-project.com/poc-project/custom-kubectl:latest
+      entrypoint: [""]
+    script:
+      - |
+        echo "🔍 Checking pod status in Production Environment"
+        sleep 60
+        labels=$(kubectl describe deployment/poc-project-deployment -n $DEPLOYMENT_NAMESPACE | grep Labels | grep appName | awk '{print $2}')
+        kubectl get pods -l "$labels" -n $DEPLOYMENT_NAMESPACE
+        echo "✅ Production pod status check completed"
     environment:
       name: $DEPLOYMENT_NAMESPACE
       url: $URL
@@ -892,17 +1143,17 @@ check-pods-status:
 # ===========================================
 # OWASP ZAP DYNAMIC APPLICATION SECURITY TESTING (DAST)
 # ===========================================
-🕷️dast-zap-baseline:
-  stage: dast_testing
+🕷️dast-zap-baseline-dev:
+  stage: dast_testing_dev
   image: owasp/zap2docker-stable
   extends:
-    - .default:rule
+    - .dev:rule
   needs:
-    - job: deploy:to:k8s
+    - job: deploy:to:dev
       artifacts: false
-    - job: 🧪e2e-testing
+    - job: 🧪e2e-testing-dev
       artifacts: false
-    - job: check-pods-status
+    - job: check-pods-status:dev
       artifacts: false
   tags:
     - docker
